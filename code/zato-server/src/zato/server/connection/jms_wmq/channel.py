@@ -12,6 +12,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import logging, os
 from copy import deepcopy
 from threading import RLock, Thread
+from time import sleep
 from traceback import format_exc
 
 # Bunch
@@ -77,9 +78,10 @@ class ConsumingConnection(BaseJMSWMQConnection):
                 self.keep_connecting = True
                 self.start()
             except Exception, e:
-                log_msg = 'Caught an exception [{0}]'.format(format_exc(e))
-                self.logger.error(log_msg)
-                raise 
+                self.logger.error(
+                    'Caught an exception, sleeping for 5 seconds, self.queue:[%s], e:[%s]', 
+                    self.queue, format_exc(e))
+                sleep(5)
         
 class ConsumingConnector(BaseJMSWMQConnector):
     """ An AMQP consuming connector started as a subprocess. Each connection to an AMQP
@@ -140,7 +142,7 @@ class ConsumingConnector(BaseJMSWMQConnector):
         self.channel.name = item.name
         self.channel.is_active = item.is_active
         self.channel.queue = str(item.queue)
-        self.channel.service = item.service_impl_name
+        self.channel.service = item.service_name
         self.channel.data_format = item.data_format
         self.channel.listener = None
             
@@ -199,7 +201,11 @@ class ConsumingConnector(BaseJMSWMQConnector):
                 for attr in MESSAGE_ATTRS:
                     params[attr] = getattr(msg, attr, None)
                 
-                self.broker_client.async_invoke(params)
+                try:
+                    self.broker_client.invoke_async(params)
+                except Exception, e:
+                    msg = 'Could not invoke_async broker with params:[%s]'
+                    self.logger.warn(msg, params)
                 
     def on_broker_msg_DEFINITION_JMS_WMQ_EDIT(self, msg, args=None):
         with self.def_lock:
@@ -228,7 +234,7 @@ def run_connector():
     def_id = os.environ['ZATO_CONNECTOR_DEF_ID']
     item_id = os.environ[ENV_ITEM_NAME]
     
-    connector = ConsumingConnector(repo_location, def_id, item_id)
+    ConsumingConnector(repo_location, def_id, item_id)
     
     logger = logging.getLogger(__name__)
     logger.debug('Starting JMS WebSphere MQ outgoing, repo_location [{0}], item_id [{1}], def_id [{2}]'.format(

@@ -10,11 +10,11 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 import logging, os, random, re, sys
-from base64 import b64encode
+from contextlib import closing
 from cStringIO import StringIO
 from datetime import datetime
 from glob import glob
-from hashlib import sha1, sha256
+from hashlib import sha256
 from importlib import import_module
 from itertools import ifilter, izip, izip_longest, tee
 from operator import itemgetter
@@ -26,6 +26,7 @@ from random import getrandbits
 from socket import gethostname, getfqdn
 from string import Template
 from threading import current_thread
+from traceback import format_exc
 
 # packaging/Distutils2
 try:
@@ -50,9 +51,6 @@ from dateutil.parser import parse
 # lxml
 from lxml import objectify
 
-# M2Crypto
-from M2Crypto import RSA
-
 # pip
 from pip.download import is_archive_file, unpack_file_url
 
@@ -64,11 +62,16 @@ from springpython.context import ApplicationContext
 from springpython.remoting.http import CAValidatingHTTPSConnection
 from springpython.remoting.xmlrpc import SSLClientTransport
 
+# SQLAlchemy
+from sqlalchemy.exc import IntegrityError
+
 # Zato
 from zato.agent.load_balancer.client import LoadBalancerAgentClient
-from zato.common import DATA_FORMAT, KVDB, NoDistributionFound, SIMPLE_IO, soap_body_path, \
-    soap_body_xpath, ZatoException
+from zato.common import DATA_FORMAT, KVDB, NoDistributionFound, scheduler_date_time_format, \
+     soap_body_path, soap_body_xpath, ZatoException
 from zato.common.crypto import CryptoManager
+from zato.common.odb.model import IntervalBasedJob, Job, Service
+from zato.common.odb.query import _service as _service
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +80,8 @@ logging.addLevelName(TRACE1, "TRACE1")
 
 _repr_template = Template('<$class_name at $mem_loc$attrs>')
 _uncamelify_re = re.compile(r'((?<=[a-z])[A-Z]|(?<!\A)[A-Z](?=[a-z]))')
+
+_epoch = datetime.utcfromtimestamp(0) # Start of UNIX epoch
 
 random.seed()
 
@@ -116,33 +121,29 @@ def pprint(obj):
 
     return value
 
-def encrypt(data, pub_key, padding=RSA.pkcs1_padding, b64=True):
-    """ Encrypt data using the given public key.
-    data - data to be encrypted
-    pub_key - public key to use (as a PEM string)
-    padding - padding to use, defaults to PKCS#1
-    b64 - should the encrypted data be BASE64-encoded before being returned, defaults to True
-    """
-    logger.debug('Using pub_key:[{}]'.format(pub_key))
-    
-    cm = CryptoManager(pub_key=pub_key)
-    cm.load_keys()
-    
-    return cm.encrypt(data, padding, b64)
-
-def decrypt(data, priv_key, padding=RSA.pkcs1_padding, b64=True):
-    """ Decrypts data using the given private key.
+def encrypt(data, priv_key, b64=True):
+    """ Encrypt data using a public key derived from the private key.
     data - data to be encrypted
     priv_key - private key to use (as a PEM string)
-    padding - padding to use, defaults to PKCS#1
-    b64 - should the data be BASE64-decoded before being decrypted, defaults to True
+    b64 - should the encrypted data be BASE64-encoded before being returned, defaults to True
     """
-    logger.debug('Using priv_key:[{}]'.format(priv_key))
     
     cm = CryptoManager(priv_key=priv_key)
     cm.load_keys()
     
-    return cm.decrypt(data, padding, b64)
+    return cm.encrypt(data, b64)
+
+def decrypt(data, priv_key, b64=True):
+    """ Decrypts data using the given private key.
+    data - data to be encrypted
+    priv_key - private key to use (as a PEM string)
+    b64 - should the data be BASE64-decoded before being decrypted, defaults to True
+    """
+    
+    cm = CryptoManager(priv_key=priv_key)
+    cm.load_keys()
+    
+    return cm.decrypt(data, b64)
 
 def get_executable():
     """ Returns the wrapper buildout uses for executing Zato commands. This has
@@ -182,7 +183,7 @@ class ColorFormatter(logging.Formatter):
         logging.Formatter.__init__(self, msg)
         self.use_color = use_color
 
-    def formatter_msg(self, msg, use_color = True):
+    def formatter_msg(self, msg, use_color=True):
         if use_color:
             msg = msg.replace("$RESET", self.RESET_SEQ).replace("$BOLD", self.BOLD_SEQ)
         else:
@@ -213,25 +214,20 @@ def object_attrs(_object, ignore_double_underscore, to_avoid_list, sort):
 
     return attrs
 
-def make_repr(_object, ignore_double_underscore=True, to_avoid_list="repr_to_avoid", sort=True):
-    """ Makes a nice string representation of an object, suitable for logging
-    purposes.
+def make_repr(_object, ignore_double_underscore=True, to_avoid_list='repr_to_avoid', sort=True):
+    """ Makes a nice string representation of an object, suitable for logging purposes.
     """
     attrs = object_attrs(_object, ignore_double_underscore, to_avoid_list, sort)
     buff = StringIO()
 
     for attr in attrs:
-
-        #if logger.isEnabledFor(TRACE1):
-        #    logger.log(TRACE1, "attr:[%s]" % attr)
-
         attr_obj = getattr(_object, attr)
         if not callable(attr_obj):
-            buff.write(" ")
-            buff.write("%r:[%r]" % (attr, attr_obj))
+            buff.write(' ')
+            buff.write('%s:[%r]' % (attr, attr_obj))
 
-    out = _repr_template.safe_substitute(class_name=_object.__class__.__name__,
-                            mem_loc=hex(id(_object)), attrs=buff.getvalue())
+    out = _repr_template.safe_substitute(
+        class_name=_object.__class__.__name__, mem_loc=hex(id(_object)), attrs=buff.getvalue())
     buff.close()
 
     return out
@@ -258,15 +254,16 @@ def get_lb_client(lb_host, lb_agent_port, ssl_ca_certs, ssl_key_file, ssl_cert_f
     if sys.version_info >= (2, 7):
         class Python27CompatTransport(SSLClientTransport):
             def make_connection(self, host):
-                return CAValidatingHTTPSConnection(host, strict=self.strict, ca_certs=self.ca_certs,
-                        keyfile=self.keyfile, certfile=self.certfile, cert_reqs=self.cert_reqs,
-                        ssl_version=self.ssl_version, timeout=self.timeout)
+                return CAValidatingHTTPSConnection(
+                    host, strict=self.strict, ca_certs=self.ca_certs,
+                    keyfile=self.keyfile, certfile=self.certfile, cert_reqs=self.cert_reqs,
+                    ssl_version=self.ssl_version, timeout=self.timeout)
         transport = Python27CompatTransport
     else:
         transport = None
     
-    return LoadBalancerAgentClient(agent_uri, ssl_ca_certs, ssl_key_file, ssl_cert_file,
-                                transport=transport, timeout=timeout)
+    return LoadBalancerAgentClient(
+        agent_uri, ssl_ca_certs, ssl_key_file, ssl_cert_file, transport=transport, timeout=timeout)
 
 def tech_account_password(password_clear, salt):
     return sha256(password_clear+ ':' + salt).hexdigest()
@@ -317,17 +314,14 @@ def get_crypto_manager(repo_location, app_context, config, load_keys=True):
     crypto_manager = app_context.get_object('crypto_manager')
     
     priv_key_location = config['crypto']['priv_key_location']
-    pub_key_location = config['crypto']['pub_key_location']
     cert_location = config['crypto']['cert_location']
     ca_certs_location = config['crypto']['ca_certs_location']
     
     priv_key_location = absolutize_path(repo_location, priv_key_location)
-    pub_key_location = absolutize_path(repo_location, pub_key_location)
     cert_location = absolutize_path(repo_location, cert_location)
     ca_certs_location = absolutize_path(repo_location, ca_certs_location)
     
     crypto_manager.priv_key_location = priv_key_location
-    crypto_manager.pub_key_location = pub_key_location
     crypto_manager.cert_location = cert_location
     crypto_manager.ca_certs_location = ca_certs_location
     
@@ -350,15 +344,15 @@ def deployment_info(method, object_, timestamp, fs_location, remote_host='', rem
     onto a server, where from and when it was.
     """
     return {
-            'method': method,
-            'object': object_,
-            'timestamp': timestamp,
-            'fs_location':fs_location,
-            'remote_host': remote_host,
-            'remote_user': remote_user,
-            'current_host': current_host(),
-            'current_user': get_current_user(),
-        }
+        'method': method,
+        'object': object_,
+        'timestamp': timestamp,
+        'fs_location':fs_location,
+        'remote_host': remote_host,
+        'remote_user': remote_user,
+        'current_host': current_host(),
+        'current_user': get_current_user(),
+    }
 
 def get_body_payload(body):
     body_children_count = body[0].countchildren()
@@ -431,13 +425,12 @@ def decompress(archive, dir_name):
 def visit_py_source(dir_name):
     for pattern in('*.py', '*.pyw'):
         glob_path = os.path.join(dir_name, pattern)
-        for py_path in glob(glob_path):
+        for py_path in sorted(glob(glob_path)):
             yield py_path
 
 def visit_py_source_from_distribution(dir_name):
     """ Yields all the Python source modules from a Distutils2 distribution.
     """
-    abs_dir = os.path.abspath(dir_name)
     path = os.path.join(dir_name, 'setup.cfg')
     if not os.path.exists(path):
         msg = "Could not find setup.cfg in [{}], path:[{}] doesn't exist".format(dir_name, path)
@@ -454,6 +447,10 @@ def visit_py_source_from_distribution(dir_name):
         package_dir = os.path.abspath(os.path.join(dir_name, package.replace('.', os.path.sep)))
         yield visit_py_source(package_dir)
 
+def _os_remove(path):
+    """ A helper function so it's easier to mock it in unittests.
+    """
+    return os.remove(path)
 
 def hot_deploy(parallel_server, file_name, path, delete_path=True):
     """ Hot-deploys a package if it looks like a Python module or an archive
@@ -466,14 +463,14 @@ def hot_deploy(parallel_server, file_name, path, delete_path=True):
         di = dumps(deployment_info('hot-deploy', file_name, now.isoformat(), path))
 
         # Insert the package into the DB ..
-        package_id = parallel_server.odb.hot_deploy(now, di, file_name, 
-            open(path, 'rb').read(), parallel_server.id)
+        package_id = parallel_server.odb.hot_deploy(
+            now, di, file_name, open(path, 'rb').read(), parallel_server.id)
 
         # .. and notify all the servers they're to pick up a delivery
         parallel_server.notify_new_package(package_id)
         
         if delete_path:
-            os.remove(path)
+            _os_remove(path)
         
         return True
         
@@ -484,6 +481,7 @@ def hot_deploy(parallel_server, file_name, path, delete_path=True):
 # As taken from http://wiki.python.org/moin/SortingListsOfDictionaries
 def multikeysort(items, columns):
     comparers = [((itemgetter(col[1:].strip()), -1) if col.startswith('-') else (itemgetter(col.strip()), 1)) for col in columns]
+    
     def comparer(left, right):
         for fn, mult in comparers:
             result = cmp(fn(left), fn(right))
@@ -532,6 +530,8 @@ def from_utc_to_local(dt, tz_name):
     dt = local_tz.normalize(dt.astimezone(local_tz))
     return dt
 
+# ##############################################################################
+
 def _utcnow():
     """ See zato.common.util.utcnow for docstring.
     """
@@ -554,6 +554,13 @@ def now(tz=None):
     """
     return _now(tz)
 
+def datetime_to_seconds(dt):
+    """ Converts a datetime object to a number of seconds since UNIX epoch.
+    """
+    return (dt - _epoch).total_seconds()
+
+# ##############################################################################
+
 def clear_locks(kvdb, server_token, kvdb_config=None, decrypt_func=None):
     """ Clears out any KVDB locks held by Zato servers.
     """
@@ -575,7 +582,7 @@ def clear_locks(kvdb, server_token, kvdb_config=None, decrypt_func=None):
     
 # Inspired by http://stackoverflow.com/a/9283563
 def uncamelify(s, separator='-', elem_func=unicode.lower):
-    """ Converts a CamelCaseName into a more readable one, e.g. 
+    """ Converts a CamelCaseName into a more readable one, e.g.
     will turn ILikeToReadWSDLDocsNotReallyNOPENotMeQ into
     i-like-to-read-wsdl-docs-not-really-nope-not-me-q or a similar one,
     depending on the value of separator and elem_func.
@@ -587,3 +594,59 @@ def get_component_name(prefix='parallel'):
     to trace which Zato component issued it.
     """
     return '{}/{}/{}/{}'.format(prefix, current_host(), os.getpid(), current_thread().name)
+
+def dotted_getattr(o, path):
+    return reduce(getattr, path.split('.'), o)
+
+
+def get_service_by_name(session, cluster_id, name):
+    logger.debug('Looking for name:[{}] in cluster_id:[{}]'.format(name, cluster_id))
+    return _service(session, cluster_id).\
+           filter(Service.name==name).\
+           one()
+
+def add_startup_jobs(cluster_id, odb, stats_jobs):
+    """ Adds one of the interval jobs to the ODB. Note that it isn't being added
+    directly to the scheduler because we want users to be able to fine-tune the job's
+    settings.
+    """
+    with closing(odb.session()) as session:
+        for item in stats_jobs:
+            
+            try:
+                service_id = get_service_by_name(session, cluster_id, item['service'])[0]
+                
+                now = datetime.utcnow().strftime(scheduler_date_time_format)
+                job = Job(None, item['name'], True, 'interval_based', now, item.get('extra', '').encode('utf-8'),
+                          cluster_id=cluster_id, service_id=service_id)
+                          
+                kwargs = {}
+                for name in('seconds', 'minutes'):
+                    if name in item:
+                        kwargs[name] = item[name]
+                        
+                ib_job = IntervalBasedJob(None, job, **kwargs)
+                
+                session.add(job)
+                session.add(ib_job)
+                session.commit()
+            except IntegrityError, e:
+                session.rollback()
+                msg = 'Caught an IntegrityError, carrying on anyway, e:[{}]]'.format(format_exc(e))
+                logger.debug(msg)
+                
+def hexlify(item):
+    """ Returns a nice hex version of a string given on input.
+    """
+    return ' '.join([elem1+elem2 for (elem1, elem2) in grouper(2, item.encode('hex'))])
+
+def validate_input_dict(cid, *validation_info):
+    """ Checks that input belongs is one of allowed values.
+    """
+    for key_name, key, source in validation_info:
+        if not source.has(key):
+            msg = 'Invalid {}:[{}]'.format(key_name, key)
+            log_msg = '{} (attrs: {})'.format(msg, source.attrs)
+            
+            logger.warn(log_msg)
+            raise ZatoException(cid, msg)

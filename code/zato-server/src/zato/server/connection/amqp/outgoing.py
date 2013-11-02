@@ -11,21 +11,19 @@ from __future__ import absolute_import, division, print_function
 # stdlib
 import logging, os
 from datetime import datetime
-from threading import currentThread, Thread
 
 # Bunch
 from bunch import Bunch
 
 # Kombu
-from kombu import Connection, Exchange
+from kombu import Connection
 from kombu.pools import producers, reset as reset_pools
 from kombu.transport.pyamqp import Transport
 
 # Zato
-from zato.common import ConnectionException
 from zato.common.broker_message import MESSAGE_TYPE, OUTGOING, TOPICS
 from zato.common.util import get_component_name, TRACE1
-from zato.server.connection.amqp import BaseAMQPConnection, BaseAMQPConnector
+from zato.server.connection.amqp import BaseAMQPConnector
 from zato.server.connection import setup_logging, start_connector as _start_connector
 
 ENV_ITEM_NAME = 'ZATO_CONNECTOR_AMQP_OUT_ID'
@@ -70,8 +68,9 @@ class PublisherFacade(object):
     """ An AMQP facade for services so they aren't aware that publishing AMQP
     messages actually requires us to use the Zato broker underneath.
     """
-    def __init__(self, broker_client):
+    def __init__(self, broker_client, delivery_store):
         self.broker_client = broker_client # A Zato broker client, not the AMQP one.
+        self.delivery_store = delivery_store
     
     def send(self, msg, out_name, exchange, routing_key, properties={}, headers={}, *args, **kwargs):
         """ Publishes the message on the Zato broker which forwards it to one of the
@@ -237,7 +236,7 @@ def run_connector():
     def_id = os.environ['ZATO_CONNECTOR_DEF_ID']
     item_id = os.environ[ENV_ITEM_NAME]
     
-    connector = OutgoingConnector(repo_location, def_id, item_id)
+    OutgoingConnector(repo_location, def_id, item_id)
     
     logger = logging.getLogger(__name__)
     logger.info('Starting AMQP connector, repo_location [{0}], item_id [{1}], def_id [{2}]'.format(

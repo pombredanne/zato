@@ -10,18 +10,27 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 import logging, os
+from datetime import datetime
 from threading import RLock, Thread
 from traceback import format_exc
 
+# anyjson
+from anyjson import dumps
+
 # Bunch
 from bunch import Bunch
+
+# retools
+from retools.lock import Lock
 
 # Spring Python
 from springpython.jms.core import JmsTemplate, TextMessage
 
 # Zato
+from zato.common import INVOCATION_TARGET, KVDB
 from zato.common.broker_message import MESSAGE_TYPE, OUTGOING, TOPICS
-from zato.common.util import TRACE1
+from zato.common.model import DeliveryItem
+from zato.common.util import new_cid, TRACE1
 from zato.server.connection import setup_logging, start_connector as _start_connector
 from zato.server.connection.jms_wmq import BaseJMSWMQConnection, BaseJMSWMQConnector
 
@@ -31,25 +40,35 @@ class WMQFacade(object):
     """ A WebSphere MQ facade for services so they aren't aware that sending WMQ
     messages actually requires us to use the Zato broker underneath.
     """
-    def __init__(self, broker_client):
+    def __init__(self, broker_client, delivery_store):
         self.broker_client = broker_client # A Zato broker client
+        self.delivery_store = delivery_store
     
     def send(self, msg, out_name, queue, delivery_mode=None, expiration=None, priority=None, max_chars_printed=None, 
-            *args, **kwargs):
+            task_id=None, *args, **kwargs):
         """ Puts a message on a WebSphere MQ queue.
         """
+        
+        # Common parameters
         params = {}
         params['action'] = OUTGOING.JMS_WMQ_SEND
         params['name'] = out_name
         params['body'] = msg
         params['queue'] = queue
-        params['delivery_mode'] = delivery_mode
-        params['expiration'] = expiration
-        params['priority'] = priority
-        params['max_chars_printed'] = max_chars_printed
+        params['delivery_mode'] = int(delivery_mode) if delivery_mode else None
+        params['expiration'] = int(expiration) if expiration else None
+        params['priority'] = int(priority) if priority else None
+        params['max_chars_printed'] = int(max_chars_printed) if max_chars_printed else None
+        
+        # Confirmed delivery
+        if task_id:
+            params['confirm_delivery'] = True
+            params['task_id'] = task_id
+        
+        # Any extra arguments
         params['args'] = args
         params['kwargs'] = kwargs
-        
+
         self.broker_client.publish(params, msg_type=MESSAGE_TYPE.TO_JMS_WMQ_PUBLISHING_CONNECTOR_ALL)
         
     def conn(self):
@@ -59,8 +78,8 @@ class WMQFacade(object):
         return self
 
 class OutgoingConnection(BaseJMSWMQConnection):
-    def __init__(self, factory, out_name):
-        super(OutgoingConnection, self).__init__(factory, out_name)
+    def __init__(self, factory, name, kvdb, delivery_store):
+        super(OutgoingConnection, self).__init__(factory, name, kvdb, delivery_store)
         self.logger = logging.getLogger(self.__class__.__name__)
         self.jms_template = JmsTemplate(self.factory)
         
@@ -69,31 +88,62 @@ class OutgoingConnection(BaseJMSWMQConnection):
         from pymqi import MQMIError
         
         self.MQMIError = MQMIError
-        self.dont_reconnect_errors = (MQRC_UNKNOWN_OBJECT_NAME, )
+        self.dont_reconnect_errors = (MQRC_UNKNOWN_OBJECT_NAME,)
+        
+    def maybe_on_target_delivery(self, msg, start, end, target_ok, queue, inner_exc=None, needs_reconnect=None):
+        if msg.get('confirm_delivery'):
+            target_self_info = dumps({
+                'name': self.name,
+                'details': {
+                    'conn_info':self.factory.get_connection_info(),
+                    'queue': queue
+                }
+            })
+            
+            exc_info = {
+                'inner_exc': inner_exc,
+                'needs_reconnect': needs_reconnect
+            }
+            
+            self.delivery_store.on_target_completed(
+                INVOCATION_TARGET.OUTCONN_WMQ, self.name, msg, start, end, target_ok, target_self_info, exc_info)
         
     def send(self, msg, default_delivery_mode, default_expiration, default_priority, default_max_chars_printed):
+        
         jms_msg = TextMessage()
+        
+        # Common named arguments first
         jms_msg.text = msg.get('body')
-        jms_msg.jms_correlation_id = msg.get('jms_correlation_id')
-        jms_msg.jms_delivery_mode = msg.get('jms_delivery_mode') or default_delivery_mode
-        jms_msg.jms_destination = msg.get('jms_destination')
-        jms_msg.jms_expiration = int(msg.get('jms_expiration') or default_expiration)
-        jms_msg.jms_message_id = msg.get('jms_message_id')
-        jms_msg.jms_priority = msg.get('jms_priority') or default_priority
-        jms_msg.jms_redelivered = msg.get('jms_redelivered')
-        jms_msg.jms_timestamp = msg.get('jms_timestamp')
+        jms_msg.jms_expiration = int(msg.get('expiration') or default_expiration)
+        jms_msg.jms_delivery_mode = msg.get('delivery_mode') or default_delivery_mode
+        jms_msg.jms_priority = msg.get('priority') or default_priority
         jms_msg.max_chars_printed = msg.get('max_chars_printed') or default_max_chars_printed
+        
+        kwargs = msg.get('kwargs')
+        
+        # JMS-specific ones now
+        jms_msg.jms_destination = kwargs.get('jms_destination')
+        jms_msg.jms_correlation_id = str(kwargs.get('jms_correlation_id'))
+        jms_msg.jms_message_id = str(kwargs.get('jms_message_id'))
+        jms_msg.jms_redelivered = kwargs.get('jms_redelivered')
+        jms_msg.jms_timestamp = kwargs.get('jms_timestamp')
         
         queue = str(msg['queue'])
         
         try:
+            start = datetime.utcnow()
             self.jms_template.send(jms_msg, queue)
+            self.maybe_on_target_delivery(msg, start, datetime.utcnow(), True, queue)
+                
         except Exception, e:
-            
             if isinstance(e, self.MQMIError) and e.reason in self.dont_reconnect_errors:
-                self.logger.warn('Caught [{}/{}] while sending the message [{}]'.format(e.reason, e.errorAsString(), jms_msg))
+                self.logger.warn(
+                    'Caught [{}/{}] while sending the message [{}] (not reconnecting)'.format(e.reason, e.errorAsString(), jms_msg))
+                self.maybe_on_target_delivery(msg, start, datetime.utcnow(), False, queue, format_exc(e), False)
+                
             else:
-                self.logger.warn('Caught [{}] while sending the message [{}]'.format(format_exc(e), jms_msg))
+                self.logger.warn('Caught [{}] while sending the message [{}] (reconnecting)'.format(format_exc(e), jms_msg))
+                self.maybe_on_target_delivery(msg, start, datetime.utcnow(), False, queue, format_exc(e), True)
                 
                 if self._keep_connecting(e):
                     self.close()
@@ -102,7 +152,7 @@ class OutgoingConnection(BaseJMSWMQConnection):
                     self.start()
                 else:
                     raise
-
+                
 class OutgoingConnector(BaseJMSWMQConnector):
     """ An outgoing connector started as a subprocess. Each connection to a queue manager
     gets its own connector.
@@ -187,7 +237,7 @@ class OutgoingConnector(BaseJMSWMQConnector):
     def _sender(self, factory):
         """ Starts the outgoing connection in a new thread and returns it.
         """
-        sender = OutgoingConnection(factory, self.out.name)
+        sender = OutgoingConnection(factory, self.out.name, self.kvdb, self.delivery_store)
         t = Thread(target=sender._run)
         t.start()
         
@@ -255,7 +305,7 @@ def run_connector():
     def_id = os.environ['ZATO_CONNECTOR_DEF_ID']
     item_id = os.environ[ENV_ITEM_NAME]
     
-    connector = OutgoingConnector(repo_location, def_id, item_id)
+    OutgoingConnector(repo_location, def_id, item_id)
     
     logger = logging.getLogger(__name__)
     logger.debug('Starting JMS WebSphere MQ outgoing, repo_location [{0}], item_id [{1}], def_id [{2}]'.format(

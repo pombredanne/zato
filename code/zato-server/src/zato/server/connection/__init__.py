@@ -14,7 +14,7 @@ from zato.server.log import ZatoLogger
 logging.setLoggerClass(ZatoLogger)
 
 # stdlib
-import errno, os, sys, time
+import errno, os, time
 from datetime import datetime
 from subprocess import Popen
 from traceback import format_exc
@@ -26,8 +26,9 @@ import psutil
 from bunch import Bunch
 
 # Zato
-from zato.broker.client import BrokerClient
+from zato.broker.thread_client import BrokerClient
 from zato.common import ZATO_ODB_POOL_NAME
+from zato.common.delivery import DeliveryStore
 from zato.common.kvdb import KVDB
 from zato.common.util import get_app_context, get_config, get_crypto_manager, get_executable, TRACE1
 from zato.server.base import BrokerMessageReceiver
@@ -37,7 +38,9 @@ class BaseConnection(object):
     connectors. Implements the (re-)connection logic and leaves all the particular
     details related to messaging to subclasses.
     """
-    def __init__(self):
+    def __init__(self, kvdb=None, delivery_store=None):
+        self.kvdb = kvdb
+        self.delivery_store = delivery_store
         self.reconnect_error_numbers = (errno.ENETUNREACH, errno.ENETRESET, errno.ECONNABORTED, 
             errno.ECONNRESET, errno.ETIMEDOUT, errno.ECONNREFUSED, errno.EHOSTUNREACH)
         self.reconnect_exceptions = ()
@@ -175,17 +178,31 @@ class BaseConnector(BrokerMessageReceiver):
         # Broker client
         self.broker_client = BrokerClient(self.kvdb, self.broker_client_id, self.broker_callbacks)
         self.broker_client.start()
+
+        # ODB        
         
-        # ODB
+        #
+        # Ticket #35 Don't ignore odb_port when creating an ODB
+        # https://github.com/zatosource/zato/issues/35
+        #
+        
+        engine = config_odb.engine
+        port = config_odb.get('port')
+        
+        if not port:
+            port = 5432 if engine == 'postgresql' else 1521
+        
         self.odb_config = Bunch()
         self.odb_config.db_name = config_odb.db_name
         self.odb_config.is_active = True
-        self.odb_config.engine = config_odb.engine
+        self.odb_config.engine = engine
         self.odb_config.extra = config_odb.extra
         self.odb_config.host = config_odb.host
+        self.odb_config.port = port
         self.odb_config.password = self.odb.crypto_manager.decrypt(config_odb.password)
         self.odb_config.pool_size = config_odb.pool_size
         self.odb_config.username = config_odb.username
+        
         self.odb_config.is_odb = True
         
         self.sql_pool_store = app_context.get_object('sql_pool_store')
@@ -193,6 +210,9 @@ class BaseConnector(BrokerMessageReceiver):
         self.odb.pool = self.sql_pool_store[ZATO_ODB_POOL_NAME].pool
         
         self._setup_odb()
+        
+        # Delivery store
+        self.delivery_store = DeliveryStore(self.kvdb, self.broker_client, self.odb, float(fs_server_config.misc.delivery_lock_timeout))
         
 def setup_logging():
     logging.addLevelName('TRACE1', TRACE1)
@@ -229,4 +249,3 @@ def start_connector(repo_location, file_, env_item_name, def_id, item_id):
     _env.update(zato_env)
     
     Popen(program, close_fds=True, shell=True, env=_env)
-    

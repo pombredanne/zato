@@ -18,11 +18,9 @@ from uuid import uuid4
 from sqlalchemy.exc import IntegrityError
 
 # Zato
-from zato.cli import common_odb_opts, get_tech_account_opts, kvdb_opts, ZatoCommand
+from zato.cli import common_odb_opts, get_tech_account_opts, ZatoCommand
 from zato.common import SIMPLE_IO
-from zato.common.defaults import http_plain_server_port
-from zato.common.odb.model import Cluster, HTTPBasicAuth, HTTPSOAP, Service, TechnicalAccount, WSSDefinition
-from zato.common.util import service_name_from_impl, tech_account_password
+from zato.common.odb.model import Cluster, HTTPBasicAuth, HTTPSOAP, Service, WSSDefinition
 
 zato_services = {
 
@@ -117,6 +115,12 @@ zato_services = {
     'zato.outgoing.zmq.edit':'zato.server.service.internal.outgoing.zmq.Edit',
     'zato.outgoing.zmq.get-list':'zato.server.service.internal.outgoing.zmq.GetList',
     
+    # Patterns - delivery
+    'zato.pattern.delivery.definition.create':'zato.server.service.internal.pattern.delivery.definition.Create',
+    'zato.pattern.delivery.definition.delete':'zato.server.service.internal.pattern.delivery.definition.Delete',
+    'zato.pattern.delivery.definition.edit':'zato.server.service.internal.pattern.delivery.definition.Edit',
+    'zato.pattern.delivery.definition.get-list':'zato.server.service.internal.pattern.delivery.definition.GetList',
+    
     # Ping services are added in Create.add_ping_services
 
     # Scheduler
@@ -198,9 +202,6 @@ class Create(ZatoCommand):
     opts.append({'name':'broker_port', 'help':'Redis port'})
     opts.append({'name':'cluster_name', 'help':'Name of the cluster to create'})
     
-    opts.append({'name':'broker_host', 'help':"Broker host (Redis)"})
-    opts.append({'name':'broker_port', 'help':'Broker port (Redis)'})
-    
     opts += get_tech_account_opts('for web admin instances to use')
     
     def execute(self, args, show_output=True):
@@ -212,12 +213,15 @@ class Create(ZatoCommand):
         cluster.name = args.cluster_name
         cluster.description = 'Created by {} on {} (UTC)'.format(self._get_user_host(), datetime.utcnow().isoformat())
         
-        for name in('odb_type', 'odb_host', 'odb_port', 'odb_user', 'odb_db_name', 
-            'broker_host', 'broker_port', 'lb_host', 'lb_port', 'lb_agent_port'):
+        for name in(
+              'odb_type', 'odb_host', 'odb_port', 'odb_user', 'odb_db_name',
+              'broker_host', 'broker_port', 'lb_host', 'lb_port', 'lb_agent_port'):
             setattr(cluster, name, getattr(args, name))
         session.add(cluster)
         
-        admin_invoke_sec = HTTPBasicAuth(None, 'admin.invoke', True, 'admin.invoke', 'Zato admin invoke', args.admin_invoke_password, cluster)
+        # TODO: getattrs below should be squared away - one of the attrs should win
+        #       and the other one should be get ridden of.
+        admin_invoke_sec = HTTPBasicAuth(None, 'admin.invoke', True, 'admin.invoke', 'Zato admin invoke', getattr(args, 'admin_invoke_password', None) or getattr(args, 'tech_account_password'), cluster)
         session.add(admin_invoke_sec)
         
         pubapi_sec = HTTPBasicAuth(None, 'pubapi', True, 'pubapi', 'Zato public API', uuid4().hex, cluster)
@@ -252,7 +256,6 @@ class Create(ZatoCommand):
         #
         # HTTPSOAP + services
         #
-        zato_soap_channels = []
         
         for name, impl_name in zato_services.iteritems():
             
@@ -261,20 +264,23 @@ class Create(ZatoCommand):
             
             # Add the HTTP channel for WSDLs
             if name == 'zato.service.get-wsdl':
-                http_soap = HTTPSOAP(None, '{}.soap'.format(name), True, True, 'channel', 'plain_http', 
+                http_soap = HTTPSOAP(
+                    None, '{}.soap'.format(name), True, True, 'channel', 'plain_http',
                     None, '/zato/wsdl', None, '', None, None, service=service, cluster=cluster)
                 session.add(http_soap)
                 
             elif name == 'zato.service.invoke':
                 self.add_admin_invoke(session, cluster, service, admin_invoke_sec)
 
-            zato_soap = HTTPSOAP(None, name, True, True, 'channel', 
-                'soap', None, '/zato/soap', None, name, '1.1', 
+            zato_soap = HTTPSOAP(
+                None, name, True, True, 'channel',
+                'soap', None, '/zato/soap', None, name, '1.1',
                 SIMPLE_IO.FORMAT.XML, service=service, cluster=cluster, security=pubapi_sec)
             session.add(zato_soap)
 
-            json_url_path = '/zato/json/{}'.format(name)            
-            json_http = HTTPSOAP(None, '{}.json'.format(name), True, True, 'channel', 'plain_http', 
+            json_url_path = '/zato/json/{}'.format(name)
+            json_http = HTTPSOAP(
+                None, '{}.json'.format(name), True, True, 'channel', 'plain_http',
                 None, json_url_path, None, '', None, SIMPLE_IO.FORMAT.JSON, service=service, cluster=cluster, security=pubapi_sec)
             session.add(json_http)
 
@@ -301,19 +307,19 @@ class Create(ZatoCommand):
         # TODO
         # Change it to /zato/json/ping
         # and add an actual /zato/ping with no data format specified.
-        ping_no_sec_channel = HTTPSOAP(None, 'zato.ping', True, True, 'channel', 
+        ping_no_sec_channel = HTTPSOAP(
+            None, 'zato.ping', True, True, 'channel',
             'plain_http', None, '/zato/ping', None, '', None, SIMPLE_IO.FORMAT.JSON, service=ping_service, cluster=cluster)
         session.add(ping_no_sec_channel)
 
-
         #
         # All the possible options
-        # 
+        #
         # Plain HTTP / Basic auth
         # SOAP / Basic auth
         # SOAP / WSS / Clear text
         #
-
+        
         transports = ['plain_http', 'soap']
         wss_types = ['clear_text']
         
@@ -333,8 +339,9 @@ class Create(ZatoCommand):
             sec = HTTPBasicAuth(None, zato_name, True, zato_name, 'Zato', password, cluster)
             session.add(sec)
             
-            channel = HTTPSOAP(None, zato_name, True, True, 'channel', transport, None, url, None, soap_action, 
-                               soap_version, data_format, service=ping_service, security=sec, cluster=cluster)
+            channel = HTTPSOAP(
+                None, zato_name, True, True, 'channel', transport, None, url, None, soap_action,
+                soap_version, data_format, service=ping_service, security=sec, cluster=cluster)
             session.add(channel)
             
             if transport == 'soap':
@@ -347,14 +354,16 @@ class Create(ZatoCommand):
                     sec = WSSDefinition(None, zato_name, True, zato_name, password, wss_type, False, True, 3600, 3600, cluster)
                     session.add(sec)
                     
-                    channel = HTTPSOAP(None, zato_name, True, True, 'channel', transport, None, url, None, soap_action, 
-                                       soap_version, data_format, service=ping_service, security=sec, cluster=cluster)
+                    channel = HTTPSOAP(
+                        None, zato_name, True, True, 'channel', transport, None, url, None, soap_action,
+                        soap_version, data_format, service=ping_service, security=sec, cluster=cluster)
                     session.add(channel)
 
     def add_admin_invoke(self, session, cluster, service, admin_invoke_sec):
         """ Adds an admin channel for invoking services from web admin and CLI.
         """
-        channel = HTTPSOAP(None, 'admin.invoke.json', True, True, 'channel', 'plain_http', 
-            None, '/zato/admin/invoke', None, '', None, SIMPLE_IO.FORMAT.JSON, service=service, cluster=cluster, 
+        channel = HTTPSOAP(
+            None, 'admin.invoke.json', True, True, 'channel', 'plain_http',
+            None, '/zato/admin/invoke', None, '', None, SIMPLE_IO.FORMAT.JSON, service=service, cluster=cluster,
             security=admin_invoke_sec)
         session.add(channel)

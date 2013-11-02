@@ -9,11 +9,10 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import logging, os, socket, traceback
+import logging, inspect, os, socket, sys, traceback
 from copy import deepcopy
 from errno import ENOENT
-from thread import start_new_thread
-from threading import local, RLock
+from threading import RLock
 from time import sleep
 from traceback import format_exc
 from uuid import uuid4
@@ -35,13 +34,13 @@ from paste.util.multidict import MultiDict
 
 # Zato
 from zato.common import CHANNEL, SIMPLE_IO, ZATO_ODB_POOL_NAME
-from zato.common.broker_message import code_to_name, MESSAGE_TYPE, STATS
-from zato.common.util import new_cid, pairwise, payload_from_request, security_def_type, TRACE1
+from zato.common.broker_message import code_to_name, STATS
+from zato.common.util import new_cid, pairwise, security_def_type, TRACE1
 from zato.server.base import BrokerMessageReceiver
 from zato.server.connection.ftp import FTPStore
-from zato.server.connection.http_soap.channel import PlainHTTPHandler, RequestDispatcher, SOAPHandler
+from zato.server.connection.http_soap.channel import RequestDispatcher, RequestHandler
 from zato.server.connection.http_soap.outgoing import HTTPSOAPWrapper
-from zato.server.connection.http_soap.security import Security as ConnectionHTTPSOAPSecurity
+from zato.server.connection.http_soap.url_data import URLData
 from zato.server.connection.sql import PoolStore, SessionWrapper
 from zato.server.stats import MaintenanceTool
 
@@ -78,32 +77,19 @@ class WorkerStore(BrokerMessageReceiver):
         self.broker_client = None
         
     def init(self):
-        plain_http_config = MultiDict()
-        soap_config = MultiDict()
-        
-        dol = deepcopy(self.worker_config.http_soap).dict_of_lists()
-        
-        for url_path in dol:
-            for item in dol[url_path]:
-                for soap_action, channel_info in item.items():
-                    if channel_info['connection'] == 'channel':
-                        if channel_info.transport == 'plain_http':
-                            config = plain_http_config.setdefault(url_path, Bunch())
-                            config[soap_action] = deepcopy(channel_info)
-                        else:
-                            config = soap_config.setdefault(url_path, Bunch())
-                            config[soap_action] = deepcopy(channel_info)
-                
-        self.request_dispatcher = RequestDispatcher(simple_io_config=self.worker_config.simple_io)
-        self.request_dispatcher.soap_handler = SOAPHandler(soap_config, self.server)
-        self.request_dispatcher.plain_http_handler = PlainHTTPHandler(plain_http_config, self.server)
         
         # Statistics maintenance
         self.stats_maint = MaintenanceTool(self.kvdb.conn)
 
-        self.request_dispatcher.security = ConnectionHTTPSOAPSecurity(
+        # Request dispatcher - matches URLs, checks security and dispatches HTTP
+        # requests to services.
+        self.request_dispatcher = RequestDispatcher(simple_io_config=self.worker_config.simple_io)
+        self.request_dispatcher.url_data = URLData(
+            deepcopy(self.worker_config.http_soap),
             self.server.odb.get_url_security(self.server.cluster_id, 'channel')[0],
             self.worker_config.basic_auth, self.worker_config.tech_acc, self.worker_config.wss)
+        
+        self.request_dispatcher.request_handler = RequestHandler(self.server)
         
         # Create all the expected connections
         self.init_sql()
@@ -131,7 +117,7 @@ class WorkerStore(BrokerMessageReceiver):
         else:
             if security_name:
                 sec_type = config.sec_type
-                func = getattr(self.request_dispatcher.security, sec_type + '_get')
+                func = getattr(self.request_dispatcher.url_data, sec_type + '_get')
                 _sec_config = func(security_name).config
                 
         if logger.isEnabledFor(TRACE1):
@@ -149,7 +135,8 @@ class WorkerStore(BrokerMessageReceiver):
             'is_active':config.is_active, 'method':config.method, 
             'name':config.name, 'transport':config.transport, 
             'address':config.host + config.url_path, 
-            'soap_action':config.soap_action, 'soap_version':config.soap_version}
+            'soap_action':config.soap_action, 'soap_version':config.soap_version,
+            'ping_method':config.ping_method, 'pool_size':config.pool_size,}
         wrapper_config.update(sec_config)
         return HTTPSOAPWrapper(wrapper_config)
     
@@ -196,7 +183,7 @@ class WorkerStore(BrokerMessageReceiver):
         """ 
         with self.update_lock:
             # Channels
-            handler = getattr(self.request_dispatcher.security, 'on_broker_msg_' + action_name)
+            handler = getattr(self.request_dispatcher.url_data, 'on_broker_msg_' + action_name)
             handler(msg)
         
             for transport in('soap', 'plain_http'):
@@ -247,12 +234,12 @@ class WorkerStore(BrokerMessageReceiver):
         """ Returns the configuration of the HTTP Basic Auth security definition
         of the given name.
         """
-        self.request_dispatcher.security.basic_auth_get(name)
+        self.request_dispatcher.url_data.basic_auth_get(name)
 
     def on_broker_msg_SECURITY_BASIC_AUTH_CREATE(self, msg, *args):
         """ Creates a new HTTP Basic Auth security definition
         """
-        self.request_dispatcher.security.on_broker_msg_SECURITY_BASIC_AUTH_CREATE(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_SECURITY_BASIC_AUTH_CREATE(msg, *args)
         
     def on_broker_msg_SECURITY_BASIC_AUTH_EDIT(self, msg, *args):
         """ Updates an existing HTTP Basic Auth security definition.
@@ -277,39 +264,39 @@ class WorkerStore(BrokerMessageReceiver):
     def tech_acc_get(self, name):
         """ Returns the configuration of the technical account of the given name.
         """
-        self.request_dispatcher.security.tech_acc_get(msg, *args)
+        self.request_dispatcher.url_data.tech_acc_get(name)
 
     def on_broker_msg_SECURITY_TECH_ACC_CREATE(self, msg, *args):
         """ Creates a new technical account.
         """
-        self.request_dispatcher.security.on_broker_msg_SECURITY_TECH_ACC_CREATE(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_SECURITY_TECH_ACC_CREATE(msg, *args)
         
     def on_broker_msg_SECURITY_TECH_ACC_EDIT(self, msg, *args):
         """ Updates an existing technical account.
         """
-        self.request_dispatcher.security.on_broker_msg_SECURITY_TECH_ACC_EDIT(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_SECURITY_TECH_ACC_EDIT(msg, *args)
         
     def on_broker_msg_SECURITY_TECH_ACC_DELETE(self, msg, *args):
         """ Deletes a technical account.
         """
-        self.request_dispatcher.security.on_broker_msg_SECURITY_TECH_ACC_DELETE(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_SECURITY_TECH_ACC_DELETE(msg, *args)
         
     def on_broker_msg_SECURITY_TECH_ACC_CHANGE_PASSWORD(self, msg, *args):
         """ Changes the password of a technical account.
         """
-        self.request_dispatcher.security.on_broker_msg_SECURITY_TECH_ACC_CHANGE_PASSWORD(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_SECURITY_TECH_ACC_CHANGE_PASSWORD(msg, *args)
             
 # ##############################################################################
 
     def wss_get(self, name):
         """ Returns the configuration of the WSS definition of the given name.
         """
-        self.request_dispatcher.security.wss_get(msg, *args)
+        self.request_dispatcher.url_data.wss_get(name)
 
     def on_broker_msg_SECURITY_WSS_CREATE(self, msg, *args):
         """ Creates a new WS-Security definition.
         """
-        self.request_dispatcher.security.on_broker_msg_SECURITY_WSS_CREATE(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_SECURITY_WSS_CREATE(msg, *args)
         
     def on_broker_msg_SECURITY_WSS_EDIT(self, msg, *args):
         """ Updates an existing WS-Security definition.
@@ -341,11 +328,14 @@ class WorkerStore(BrokerMessageReceiver):
         """ Triggered by external processes, such as AMQP or the singleton's scheduler,
         creates a new service instance and invokes it.
         """
+        # WSGI environment is the best place we have to store raw msg in
+        wsgi_environ = {'zato.request_ctx.async_msg':msg}
+        
         service = self.server.service_store.new_instance_by_name(msg.service)
         service.update_handle(self._set_service_response_data, service, msg.payload,
             channel, msg.get('data_format'), msg.get('transport'), self.server,
             self.broker_client, self, msg.cid, self.worker_config.simple_io,
-            job_type=msg.get('job_type'))
+            job_type=msg.get('job_type'), wsgi_environ=wsgi_environ)
 
 # ##############################################################################
 
@@ -389,22 +379,12 @@ class WorkerStore(BrokerMessageReceiver):
     def on_broker_msg_CHANNEL_HTTP_SOAP_CREATE_EDIT(self, msg, *args):
         """ Creates or updates an HTTP/SOAP channel.
         """
-        # Security
-        self.request_dispatcher.security.on_broker_msg_CHANNEL_HTTP_SOAP_CREATE_EDIT(msg, *args)
-        
-        # A mapping between a URL and a service
-        handler = getattr(self.request_dispatcher, msg.transport + '_handler')
-        handler.on_broker_msg_CHANNEL_HTTP_SOAP_CREATE_EDIT(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_CHANNEL_HTTP_SOAP_CREATE_EDIT(msg, *args)
         
     def on_broker_msg_CHANNEL_HTTP_SOAP_DELETE(self, msg, *args):
         """ Deletes an HTTP/SOAP channel.
         """
-        # Security
-        self.request_dispatcher.security.on_broker_msg_CHANNEL_HTTP_SOAP_DELETE(msg, *args)
-        
-        # A mapping between a URL and a service
-        handler = getattr(self.request_dispatcher, msg.transport + '_handler')
-        handler.on_broker_msg_CHANNEL_HTTP_SOAP_DELETE(msg, *args)
+        self.request_dispatcher.url_data.on_broker_msg_CHANNEL_HTTP_SOAP_DELETE(msg, *args)
 
 # ##############################################################################
 
@@ -416,8 +396,16 @@ class WorkerStore(BrokerMessageReceiver):
         
         # Delete the connection first, if it exists at all ..
         try:
-            del config_dict[name]
-        except(KeyError, AttributeError), e:
+            try:
+                wrapper = config_dict[name].conn
+            except (KeyError, AttributeError), e:
+                log_func('Could not access a wrapper, e:[{}]'.format(format_exc(e)))
+            else:
+                try:
+                    wrapper.session.close()
+                finally:
+                    del config_dict[name]
+        except Exception, e:
             log_func('Could not delete an outgoing HTTP/SOAP connection, e:[{}]'.format(format_exc(e)))
         
     def on_broker_msg_OUTGOING_HTTP_SOAP_CREATE_EDIT(self, msg, *args):
@@ -450,6 +438,9 @@ class WorkerStore(BrokerMessageReceiver):
         """ Deletes the service from the service store and removes it from the filesystem
         if it's not an internal one.
         """
+        # Module this service is in so it can be removed from sys.modules
+        mod = inspect.getmodule(self.server.service_store.services[msg.impl_name]['service_class'])
+
         # Where to delete it from in the second step
         fs_location = self.server.service_store.services[msg.impl_name]['deployment_info']['fs_location']
         
@@ -470,6 +461,9 @@ class WorkerStore(BrokerMessageReceiver):
                 except OSError, e:
                     if e.errno != ENOENT:
                         raise
+        
+        # Makes it actually gets reimported next time it's redeployed
+        del sys.modules[mod.__name__]
                 
     def on_broker_msg_SERVICE_EDIT(self, msg, *args):
         for name in('is_active', 'slow_threshold'):
@@ -509,7 +503,7 @@ class WorkerStore(BrokerMessageReceiver):
         # into smaller one day-long batches.
         if(stop-start).days:
             for elem1, elem2 in pairwise(elem for elem in rrule(DAILY, dtstart=start, until=stop)):
-                self.broker_client.async_invoke({'action':STATS.DELETE_DAY, 'start':elem1.isoformat(), 'stop':elem2.isoformat()})
+                self.broker_client.invoke_async({'action':STATS.DELETE_DAY, 'start':elem1.isoformat(), 'stop':elem2.isoformat()})
                    
                 # So as not to drown the broker with a sudden surge of messages
                 sleep(0.02)

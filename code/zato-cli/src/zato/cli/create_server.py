@@ -9,7 +9,7 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import os, shutil, uuid
+import os, uuid
 from copy import deepcopy
 from datetime import datetime
 from multiprocessing import cpu_count
@@ -53,6 +53,7 @@ db_name={odb_db_name}
 engine={odb_engine}
 extra=
 host={odb_host}
+port={odb_port}
 password={odb_password}
 pool_size={odb_pool_size}
 username={odb_user}
@@ -62,6 +63,7 @@ pickup_dir=../../pickup-dir
 work_dir=../../work
 backup_history=100
 backup_format=bztar
+delete_after_pick_up=True
 
 # These three are relative to work_dir
 current_work_dir=./hot-deploy/current
@@ -71,7 +73,7 @@ last_backup_work_dir=./hot-deploy/backup/last
 [singleton]
 initial_sleep_time=500
 
-# If a server doesn't update its keep alive data in 
+# If a server doesn't update its keep alive data in
 # connector_server_keep_alive_job_time * grace_time_multiplier seconds
 # it will be considered down and another server from the cluster will assume
 # the control of connectors
@@ -85,6 +87,7 @@ context_class=zato.server.spring_context.ZatoContext
 internal_services_may_be_deleted=False
 initial_cluster_name = {initial_cluster_name}
 initial_server_name = {initial_server_name}
+delivery_lock_timeout = 2
 
 [kvdb]
 host={kvdb_host}
@@ -95,13 +98,32 @@ db=0
 socket_timeout=
 charset=
 errors=
+
+[startup_services]
+zato.helpers.input-logger=Sample payload for a startup service
+zato.pattern.delivery.dispatch-auto-resubmit=
+
+[patterns]
+delivery_auto_lock_timeout=90
+delivery_retry_threshold_multiplier=4
+
+[profiler]
+enabled=False
+profiler_dir=profiler
+log_filename=profiler.log
+cachegrind_filename=cachegrind.out
+discard_first_request=True
+flush_at_shutdown=True
+url_path=/zato-profiler
+unwind=False
+
 """.encode('utf-8')
 
 service_sources_contents = """# Visit https://zato.io/docs for more information.
 
 # All paths are relative to server root so that, for instance,
 # ./my-services will resolve to /opt/zato/server1/my-services if a server has been
-# installed into /opt/zato/server1 
+# installed into /opt/zato/server1
 
 # List your service sources below, each on a separate line.
 
@@ -113,13 +135,13 @@ service_sources_contents = """# Visit https://zato.io/docs for more information.
 
 default_odb_pool_size = 1
 
-directories = ('config', 'config/repo', 'config/zdaemon', 'pickup-dir', 'logs', 'work',
+directories = ('config', 'config/repo', 'config/zdaemon', 'logs', 'pickup-dir', 'profiler', 'work',
                'work/hot-deploy', 'work/hot-deploy/current', 'work/hot-deploy/backup', 'work/hot-deploy/backup/last')
 files = {'config/repo/logging.conf':common_logging_conf_contents.format(log_path='./logs/server.log'),
          'config/repo/service-sources.txt':service_sources_contents}
 
 priv_key_location = './config/repo/config-priv.pem'
-pub_key_location = './config/repo/config-pub.pem'
+priv_key_location = './config/repo/config-pub.pem'
 
 class Create(ZatoCommand):
     """ Creates a new Zato server
@@ -130,7 +152,7 @@ class Create(ZatoCommand):
     opts = deepcopy(common_odb_opts)
     opts.extend(kvdb_opts)
     
-    opts.append({'name':'pub_key_path', 'help':"Path to the server's public key in PEM"})
+    opts.append({'name':'priv_key_path', 'help':"Path to the server's public key in PEM"})
     opts.append({'name':'priv_key_path', 'help':"Path to the server's private key in PEM"})
     opts.append({'name':'cert_path', 'help':"Path to the server's certificate in PEM"})
     opts.append({'name':'ca_certs_path', 'help':"Path to the a PEM list of certificates the server will trust"})
@@ -161,8 +183,8 @@ class Create(ZatoCommand):
         session = self._get_session(engine)
         
         cluster = session.query(Cluster).\
-                   filter(Cluster.name == args.cluster_name).\
-                   first()
+            filter(Cluster.name == args.cluster_name).\
+            first()
         
         if not cluster:
             msg = "Cluster [{}] doesn't exist in the ODB".format(args.cluster_name)
@@ -185,7 +207,7 @@ class Create(ZatoCommand):
     
             repo_dir = os.path.join(self.target_dir, 'config', 'repo')
             self.copy_server_crypto(repo_dir, args)
-            pub_key = open(os.path.join(repo_dir, 'zato-server-pub-key.pem')).read()
+            priv_key = open(os.path.join(repo_dir, 'zato-server-priv-key.pem')).read()
             
             if show_output:
                 self.logger.debug('Created a Bazaar repo in {}'.format(repo_dir))
@@ -214,19 +236,20 @@ class Create(ZatoCommand):
                 server_conf_template.format(
                     port=port,
                     gunicorn_workers=cpu_count(),
-                    odb_db_name=args.odb_db_name, 
-                    odb_engine=args.odb_type, 
+                    odb_db_name=args.odb_db_name,
+                    odb_engine=args.odb_type,
                     odb_host=args.odb_host,
-                    odb_password=encrypt(args.odb_password, pub_key), 
+                    odb_port=args.odb_port,
+                    odb_password=encrypt(args.odb_password, priv_key), 
                     odb_pool_size=default_odb_pool_size, 
                     odb_user=args.odb_user, 
                     token=self.token, 
                     kvdb_host=args.kvdb_host,
-                    kvdb_port=args.kvdb_port, 
-                    kvdb_password=encrypt(args.kvdb_password, pub_key) if args.kvdb_password else '',
-                    initial_cluster_name=args.cluster_name, 
-                    initial_server_name=args.server_name, 
-                    ))
+                    kvdb_port=args.kvdb_port,
+                    kvdb_password=encrypt(args.kvdb_password, priv_key) if args.kvdb_password else '',
+                    initial_cluster_name=args.cluster_name,
+                    initial_server_name=args.server_name,
+                ))
             server_conf.close()
             
             if show_output:

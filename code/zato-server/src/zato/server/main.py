@@ -16,21 +16,24 @@ logging.setLoggerClass(ZatoLogger)
 logging.captureWarnings(True)
 
 # stdlib
-import glob, os, sys
+import os, sys
 import logging.config
-from threading import currentThread
 
 # gunicorn
 from gunicorn.app.base import Application
 
+# Paste
+from paste.util.converters import asbool
+
 # psycopg2
 import psycopg2
 
+# Repoze
+from repoze.profile import ProfileMiddleware
+
 # Zato
-from zato.common import KVDB
 from zato.common.repo import RepoManager
 from zato.common.util import clear_locks, get_app_context, get_config, get_crypto_manager, TRACE1
-from zato.server.pickup import get_pickup
 
 class ZatoGunicornApplication(Application):
     def __init__(self, zato_wsgi_app, config_main, *args, **kwargs):
@@ -101,7 +104,7 @@ def run(base_dir):
     parallel_server.repo_location = repo_location
     parallel_server.base_dir = base_dir
     parallel_server.fs_server_config = config
-    parallel_server.stats_jobs = app_context.get_object('stats_jobs')
+    parallel_server.startup_jobs = app_context.get_object('startup_jobs')
     parallel_server.app_context = app_context
 
     # Remove all locks possibly left over by previous server instances
@@ -109,6 +112,21 @@ def run(base_dir):
         
     # Turn the repo dir into an actual repository and commit any new/modified files
     RepoManager(repo_location).ensure_repo_consistency()
+
+
+    # This is new in 1.2 so is optional
+    profiler_enabled = config.get('profiler', {}).get('enabled', False)
+    
+    if asbool(profiler_enabled):
+        profiler_dir = os.path.abspath(os.path.join(base_dir, config.profiler.profiler_dir))
+        parallel_server.on_wsgi_request = ProfileMiddleware(
+            parallel_server.on_wsgi_request,
+            log_filename = os.path.join(profiler_dir, config.profiler.log_filename),
+            cachegrind_filename = os.path.join(profiler_dir, config.profiler.cachegrind_filename),
+            discard_first_request = config.profiler.discard_first_request,
+            flush_at_shutdown = config.profiler.flush_at_shutdown,
+            path = config.profiler.url_path,
+            unwind = config.profiler.unwind)
 
     # Run the app at last
     zato_gunicorn_app.run()

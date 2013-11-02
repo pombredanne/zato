@@ -8,6 +8,12 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()
+except ImportError:
+    pass
+
 # stdlib
 import json, os
 from logging import getLogger
@@ -16,7 +22,6 @@ from wsgiref.simple_server import make_server
 # Django
 from django.core.handlers.wsgi import WSGIHandler
 from django.core.management import call_command
-from django.core.servers.basehttp import AdminMediaHandler
 
 # Zato
 from zato.admin.zato_settings import update_globals

@@ -77,7 +77,7 @@ class Create(_FTPService):
                 item.port = input.port
                 item.user = input.user
                 item.acct = input.acct
-                item.timeout = input.timeout
+                item.timeout = input.timeout or None
 
                 session.add(item)
                 session.commit()
@@ -127,7 +127,7 @@ class Edit(_FTPService):
                 item.port = input.port
                 item.user = input.user
                 item.acct = input.acct
-                item.timeout = input.timeout
+                item.timeout = input.timeout or None
                 
                 input.old_name = old_name
 
@@ -182,7 +182,7 @@ class ChangePassword(ChangePasswordBase):
         response_elem = 'zato_outgoing_ftp_change_password_response'
     
     def handle(self):
-        with closing(self.odb.session()) as session:
-            def _auth(instance, password):
-                instance.password = password
-            self._handle(OutgoingFTP, _auth, OUTGOING.FTP_CHANGE_PASSWORD)
+        def _auth(instance, password):
+            instance.password = password
+            
+        self._handle(OutgoingFTP, _auth, OUTGOING.FTP_CHANGE_PASSWORD)

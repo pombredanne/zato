@@ -24,16 +24,17 @@ from zato.common import KVDB as _KVDB
 # Redis PyParsing grammar
 
 quot = Optional(oneOf(('"', "'")))
-command = oneOf(('CONFIG', 'DBSIZE', 'DECR', 'DECRBY', 'DEL', 'DUMP', 'ECHO', 
-    'EXISTS', 'EXPIRE', 'EXPIREAT', 'FLUSHDB', 'GET', 
-    'HDEL', 'HEXISTS', 'HGET', 'HGETALL', 'HINCRBY', 'HKEYS', 'HLEN', 'HSETNX', 
-    'HVALS', 'INCR', 'INCRBY', 'INFO', 'KEYS', 'LLEN', 'LPOP', 'LPUSH', 'LPUSHX', 
+command = oneOf((
+    'CONFIG', 'DBSIZE', 'DECR', 'DECRBY', 'DEL', 'DUMP', 'ECHO',
+    'EXISTS', 'EXPIRE', 'EXPIREAT', 'FLUSHDB', 'GET',
+    'HDEL', 'HEXISTS', 'HGET', 'HGETALL', 'HINCRBY', 'HKEYS', 'HLEN', 'HSETNX',
+    'HVALS', 'INCR', 'INCRBY', 'INFO', 'KEYS', 'LLEN', 'LPOP', 'LPUSH', 'LPUSHX',
     'LRANGE', 'LREM', 'LSET', 'LTRIM', 'MGET', 'MSET', 'MSETNX', 'OBJECT', 'PERSIST',
     'PEXPIRE', 'PEXPIREAT', 'PING', 'PSETEX', 'PTTL', 'RANDOMKEY', 'RENAME', 'RENAMENX', 
-    'RESTORE', 'RPOP', 'SADD', 'SET', 'SMEMBERS', 'SREM', 'TIME', 'TTL', 'TYPE', 
+    'RESTORE', 'RPOP', 'SADD', 'SET', 'SISMEMBER', 'SMEMBERS', 'SREM', 'TIME', 'TTL', 'TYPE', 
     'ZADD', 'ZRANGE', 'ZREM'), caseless=True).setResultsName('command')
-parameters = (OneOrMore(quot + Word(alphanums + '-' + punctuation) + quot)).setResultsName('parameters')
-redis_grammar = quot + command + Optional(White().suppress() + parameters)
+parameters = (OneOrMore(Word(alphanums + '-' + punctuation))).setResultsName('parameters')
+redis_grammar = command + Optional(White().suppress() + parameters)
 
 class KVDB(object):
     """ A wrapper around the Zato's key-value database.

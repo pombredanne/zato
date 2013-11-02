@@ -8,8 +8,14 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()
+except ImportError:
+    pass
+
 # stdlib
-import os, json, shutil, uuid
+import os, json, uuid
 from copy import deepcopy
 from random import getrandbits
 from traceback import format_exc
@@ -19,7 +25,7 @@ from django.core.management import call_command
 
 # Zato
 # TODO: There really shouldn't be any direct dependency between zato-cli and zato-web-admin
-from zato.admin.zato_settings import update_globals 
+from zato.admin.zato_settings import update_globals
 
 from zato.cli import get_tech_account_opts, common_logging_conf_contents, common_odb_opts, ZatoCommand
 from zato.common.defaults import web_admin_host, web_admin_port
@@ -97,7 +103,7 @@ class Create(ZatoCommand):
         password = password if password else generate_password()
         
         self.copy_web_admin_crypto(repo_dir, args)
-        pub_key = open(os.path.join(repo_dir, 'web-admin-pub-key.pem')).read()
+        priv_key = open(os.path.join(repo_dir, 'web-admin-priv-key.pem')).read()
         
         config = {
             'host': web_admin_host,
@@ -106,13 +112,13 @@ class Create(ZatoCommand):
             'log_config': 'logging.conf',
             'DATABASE_NAME': args.odb_db_name,
             'DATABASE_USER': args.odb_user,
-            'DATABASE_PASSWORD': encrypt(args.odb_password, pub_key),
+            'DATABASE_PASSWORD': encrypt(args.odb_password, priv_key),
             'DATABASE_HOST': args.odb_host,
             'DATABASE_PORT': args.odb_port,
             'SITE_ID': getrandbits(20),
-            'SECRET_KEY': encrypt(uuid.uuid4().hex, pub_key),
+            'SECRET_KEY': encrypt(uuid.uuid4().hex, priv_key),
             'ADMIN_INVOKE_NAME':'admin.invoke',
-            'ADMIN_INVOKE_PASSWORD':encrypt(args.admin_invoke_password, pub_key),
+            'ADMIN_INVOKE_PASSWORD':encrypt(getattr(args, 'admin_invoke_password', None) or getattr(args, 'tech_account_password'), priv_key),
         }
         
         open(os.path.join(repo_dir, 'logging.conf'), 'w').write(common_logging_conf_contents.format(log_path='./logs/web-admin.log'))
@@ -137,7 +143,8 @@ class Create(ZatoCommand):
         call_command('loaddata', initial_data_json_path, verbosity=0)
         
         try:
-            call_command('createsuperuser', interactive=False, username=user_name, first_name='admin-first-name',
+            call_command(
+                'createsuperuser', interactive=False, username=user_name, first_name='admin-first-name',
                 last_name='admin-last-name', email='admin@invalid.example.com')
             admin_created = True
 

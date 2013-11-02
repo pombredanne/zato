@@ -21,9 +21,13 @@ from anyjson import dumps
 # Bunch
 from bunch import Bunch
 
+# Django
+from django.http import QueryDict
+
 # Zato
-from zato.common import CHANNEL, SIMPLE_IO, URL_TYPE, zato_namespace, ZATO_ERROR, ZATO_NONE, ZATO_OK
-from zato.common.util import payload_from_request, security_def_type, TRACE1
+from zato.common import CHANNEL, DATA_FORMAT, SIMPLE_IO, URL_PARAMS_PRIORITY, \
+     URL_TYPE, zato_namespace, ZATO_ERROR, ZATO_NONE, ZATO_OK
+from zato.common.util import security_def_type, TRACE1
 from zato.server.connection.http_soap import BadRequest, ClientHTTPError, \
      NotFound, Unauthorized
 from zato.server.service.internal import AdminService
@@ -34,7 +38,7 @@ _status_internal_server_error = b'{} {}'.format(INTERNAL_SERVER_ERROR, responses
 _status_not_found = b'{} {}'.format(NOT_FOUND, responses[NOT_FOUND])
 _status_unauthorized = b'{} {}'.format(UNAUTHORIZED, responses[UNAUTHORIZED])
 
-soap_doc = b"""<?xml version='1.0' encoding='UTF-8'?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns="https://zato.io/ns/20130518"><soap:Body>{body}</soap:Body></soap:Envelope>"""
+soap_doc = b"""<?xml version='1.0' encoding='UTF-8'?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns="https://zato.io/ns/20130518"><soap:Body>{body}</soap:Body></soap:Envelope>""" # noqa
 
 zato_message_soap = b"""<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns="https://zato.io/ns/20130518">
   <soap:Body>{data}</soap:Body>
@@ -84,11 +88,10 @@ def get_client_error_wrapper(transport, data_format):
 class RequestDispatcher(object):
     """ Dispatches all the incoming HTTP/SOAP requests to appropriate handlers.
     """
-    def __init__(self, security=None, soap_handler=None, plain_http_handler=None,
-                 simple_io_config=None):
+    def __init__(self, url_data=None, security=None, request_handler=None, simple_io_config=None):
+        self.url_data = url_data
         self.security = security
-        self.soap_handler = soap_handler
-        self.plain_http_handler = plain_http_handler
+        self.request_handler = request_handler
         self.simple_io_config = simple_io_config
         
     def wrap_error_message(self, cid, url_type, msg):
@@ -99,7 +102,18 @@ class RequestDispatcher(object):
         
         # Let's return the message as-is if we didn't have any specific envelope
         # to use.
-        return msg        
+        return msg
+    
+    def _handle_quotes_soap_action(self, soap_action):
+        """ Make sure quotes around SOAP actions are ignored so these two
+        are equivalent:
+        - SOAPAction: "my.soap.action"
+        - SOAPAction: my.soap.action
+        """
+        if soap_action[0] == '"' and soap_action[-1] == '"':
+            soap_action = soap_action[1:-1]
+            
+        return soap_action
     
     def dispatch(self, cid, req_timestamp, wsgi_environ, worker_store):
         """ Base method for dispatching incoming HTTP/SOAP messages. If the security
@@ -107,52 +121,56 @@ class RequestDispatcher(object):
         the security validation is being performed. Otherwise, that step 
         is postponed until a concrete transport-specific handler is invoked.
         """
+        
+        # Needed in later steps
         path_info = wsgi_environ['PATH_INFO']
         soap_action = wsgi_environ.get('HTTP_SOAPACTION', '')
-        url_data = self.security.url_sec_get(path_info, soap_action)
-        payload = wsgi_environ['wsgi.input'].read()
         
-        if logger.isEnabledFor(logging.DEBUG):
-            msg = 'cid:[{}], payload:[{}], wsgi_environ:[{}]'.format(cid, payload, wsgi_environ)
-            logger.debug(msg)
+        # Fix up SOAP action - turns "my:soap:action" into my:soap:action,
+        # that is, strips it out of surrounding quotes, if any.
+        if soap_action:
+            soap_action = self._handle_quotes_soap_action(soap_action)
 
-        if url_data:
-            transport = url_data['transport']
-            data_format = url_data['data_format']
+        # Can we recognize this combination of URL path and SOAP action at all?
+        url_match, channel_item = self.url_data.match(path_info, soap_action)
+        
+        # OK, we can possibly handle it
+        if url_match:
+
+            # Raise 404 if the channel is inactive
+            if not channel_item.is_active:
+                logger.warn('url_data:[%s] is not active, raising NotFound', sorted(url_match.items()))
+                raise NotFound(cid, 'Channel inactive')
+            
+            # Read payload only now, right before it's needed the first time,
+            # possibly, by security checks.
+            payload = wsgi_environ['wsgi.input'].read()
+            
             try:
-                if not url_data.is_active:
-                    msg = 'url_data:[{}] is not active, raising NotFound'.format(sorted(url_data.items()))
-                    logger.warn(msg)
-                    raise NotFound(cid, 'Inactive channel')
                 
-                if url_data.sec_def != ZATO_NONE:
-                    if url_data.sec_def.sec_type in(security_def_type.tech_account, security_def_type.basic_auth, 
-                                                security_def_type.wss):
-                        self.security.handle(cid, url_data, path_info, payload, wsgi_environ)
-                    else:
-                        log_msg = '[{0}] sec_def.sec_type:[{1}] needs no auth'.format(cid, url_data.sec_def.sec_type)
-                        logger.debug(log_msg)
-                else:
-                    log_msg = '[{0}] No security for URL [{1}]'.format(cid, path_info)
-                    logger.debug(log_msg)
+                # Will raise an exception on any security violation
+                self.url_data.check_security(cid, channel_item, path_info, payload, wsgi_environ)
+
+                # OK, no security exception at that point means we can finally
+                # invoke the service.
+                response = self.request_handler.handle(cid, url_match, channel_item, wsgi_environ, 
+                    payload, worker_store, self.simple_io_config)
                 
-                handler = getattr(self, '{0}_handler'.format(transport))
+                # Got response from the service so we can construct response headers now
+                self.add_response_headers(wsgi_environ, response)
 
-                service_info, response = handler.handle(cid, wsgi_environ, payload, transport, worker_store, 
-                    self.simple_io_config, data_format, path_info)
-                wsgi_environ['zato.http.response.headers']['Content-Type'] = response.content_type
-                wsgi_environ['zato.http.response.headers'].update(response.headers)
-                wsgi_environ['zato.http.response.status'] = b'{} {}'.format(response.status_code, responses[response.status_code])
-
+                # Return the payload to the client
                 return response.payload
 
             except Exception, e:
+                
                 _format_exc = format_exc(e)
                 status = _status_internal_server_error
+                
                 if isinstance(e, ClientHTTPError):
                     response = e.msg
                     status_code = e.status
-                    reason = e.reason
+                    
                     if isinstance(e, Unauthorized):
                         status = _status_unauthorized
                         wsgi_environ['zato.http.response.headers']['WWW-Authenticate'] = e.challenge
@@ -165,103 +183,100 @@ class RequestDispatcher(object):
                 # TODO: This should be configurable. Some people may want such
                 # things to be on DEBUG whereas for others ERROR will make most sense
                 # in given circumstances.
-                if logger.isEnabledFor(logging.ERROR):
-                    msg = 'Caught an exception, cid:[{0}], status_code:[{1}], _format_exc:[{2}]'.format(
-                        cid, status_code, _format_exc)
-                    logger.log(logging.ERROR, msg)
+                logger.error('Caught an exception, cid:[%s], status_code:[%s], _format_exc:[%s]', cid, status_code, _format_exc)
                     
                 try:
-                    error_wrapper = get_client_error_wrapper(transport, data_format)
+                    error_wrapper = get_client_error_wrapper(channel_item.transport, channel_item.data_format)
                 except KeyError:
                     # It's OK. Apparently it's neither 'soap' nor json'
                     if logger.isEnabledFor(TRACE1):
-                        msg = 'No client error wrapper for transport:[{}], data_format:[{}]'.format(transport, data_format)
+                        msg = 'No client error wrapper for transport:[{}], data_format:[{}]'.format(
+                            channel_item.transport, channel_item.data_format)
                         logger.log(TRACE1, msg)
                 else:
                     response = error_wrapper(cid, response)
                     
                 wsgi_environ['zato.http.response.status'] = status
                 return response
+            
+        # This is 404, no such URL path and SOAP action is known.
         else:
-            response = "[{}] URL:[{}] or SOAP action:[{}] doesn't exist".format(cid, path_info, soap_action)
+            response = "[{}] Unknown URL:[{}] or SOAP action:[{}]".format(cid, path_info, soap_action)
             wsgi_environ['zato.http.response.status'] = _status_not_found
             
             logger.error(response)
             return response
         
-class _BaseMessageHandler(object):
-    
-    def __init__(self, http_soap={}, server=None):
-        self.http_soap = http_soap
+    def add_response_headers(self, wsgi_environ, response):
+        """ Adds HTTP response headers on a 200 OK.
+        """
+        wsgi_environ['zato.http.response.headers']['Content-Type'] = response.content_type
+        wsgi_environ['zato.http.response.headers'].update(response.headers)
+        wsgi_environ['zato.http.response.status'] = b'{} {}'.format(response.status_code, responses[response.status_code])
+        
+# ##############################################################################
+        
+class RequestHandler(object):
+    """ Handles individual HTTP requests to a given service.
+    """
+    def __init__(self, server=None):
         self.server = server # A ParallelServer instance
-    
-    def init(self, cid, path_info, request, headers, transport, data_format):
-
-        if transport == 'soap':
-            # HTTP headers are all uppercased at this point.
-            soap_action = headers.get('HTTP_SOAPACTION')
-    
-            if not soap_action:
-                raise BadRequest(cid, 'Client did not send the SOAPAction header')
-    
-            # SOAP clients may send an empty header, i.e. SOAPAction: "",
-            # as opposed to not sending the header at all.
-            soap_action = soap_action.lstrip('"').rstrip('"')
-    
-            if not soap_action:
-                raise BadRequest(cid, 'Client sent an empty SOAPAction header')
-        else:
-            soap_action = ''
-
-        _soap_actions = self.http_soap.getall(path_info)
-        
-        for _soap_action_info in _soap_actions:
-            
-            # TODO: Remove the call to .keys() when this pull request is merged in
-            #       https://github.com/dsc/bunch/pull/4
-            if soap_action in _soap_action_info.keys():
-                service_info = _soap_action_info[soap_action]
-                break
-        else:
-            msg = '[{0}] Could not find the service config for URL:[{1}], SOAP action:[{2}]'.format(
-                cid, path_info, soap_action)
-            logger.warn(msg)
-            raise NotFound(cid, msg)
-
-        logger.debug('[{0}] impl_name:[{1}]'.format(cid, service_info.impl_name))
-
-        if(logger.isEnabledFor(TRACE1)):
-            buff = StringIO()
-            pprint(self.server.service_store.services, stream=buff)
-            logger.log(TRACE1, '[{0}] service_store.services:[{1}]'.format(cid, buff.getvalue()))
-            buff.close()
-            
-        service_data = self.server.service_store.service_data(service_info.impl_name)
-        
-        return service_info
-    
-    def handle_security(self):
-        raise NotImplementedError('Must be implemented by subclasses')
         
     def _set_response_data(self, service, **kwargs):
+        """ A callback invoked by the services after it's done producing the response.
+        """
         data_format = kwargs.get('data_format')
         transport = kwargs.get('transport')
         
         self.set_payload(service.response, data_format, transport, service)
-        self.set_content_type(service.response, data_format, transport, kwargs['service_info'])
+        self.set_content_type(service.response, data_format, transport, kwargs['url_match'])
         
         return service.response
     
-    def handle(self, cid, wsgi_environ, raw_request, transport, worker_store, simple_io_config, data_format, path_info):
+    def create_channel_params(self, url_match, channel_item, wsgi_environ, raw_request):
+        """ Collects parameters specific to this channel (HTTP) and updates wsgi_environ
+        with HTTP-specific data.
+        """
+        path_params = url_match.named
+        
+        qs = wsgi_environ.get('QUERY_STRING')
+        qs = QueryDict(qs, encoding='utf-8')
+            
+        if channel_item.data_format == DATA_FORMAT.POST:
+            post = QueryDict(raw_request, encoding='utf-8')
+        else:
+            post = QueryDict(None, encoding='utf-8')
+            
+        wsgi_environ['zato.http.GET'] = qs
+        wsgi_environ['zato.http.POST'] = post
+        
+        if channel_item.url_params_pri == URL_PARAMS_PRIORITY.QS_OVER_PATH:
+            path_params.update((key, value) for key, value in qs.items())
+            channel_params = path_params
+        else:
+            channel_params = dict((key, value) for key, value in qs.items())
+            channel_params.update(path_params)
+            
+        return channel_params
     
-        service_info = self.init(cid, path_info, raw_request, wsgi_environ, transport, data_format)
-        service = self.server.service_store.new_instance(service_info.impl_name)
+    def handle(self, cid, url_match, channel_item, wsgi_environ, raw_request, worker_store, simple_io_config):
+        """ Create a new instance of a service and invoke it.
+        """
+        service = self.server.service_store.new_instance(channel_item.service_impl_name)
+        
+        if channel_item.merge_url_params_req:
+            channel_params = self.create_channel_params(url_match, channel_item, wsgi_environ, raw_request)
+        else:
+            channel_params = None
         
         response = service.update_handle(self._set_response_data, service, raw_request,
-            CHANNEL.HTTP_SOAP, data_format, transport, self.server, worker_store.broker_client,
-            worker_store, cid, simple_io_config, service_info=service_info, wsgi_environ=wsgi_environ)
+            CHANNEL.HTTP_SOAP, channel_item.data_format, channel_item.transport, self.server, worker_store.broker_client,
+            worker_store, cid, simple_io_config, wsgi_environ=wsgi_environ, 
+            url_match=url_match, channel_item=channel_item, channel_params=channel_params,
+            merge_channel_params=channel_item.merge_url_params_req,
+            params_priority=channel_item.params_pri)
                 
-        return service_info, response
+        return response
 
     # ##########################################################################
     
@@ -317,7 +332,7 @@ class _BaseMessageHandler(object):
             if not isinstance(service_instance, AdminService):
                 response.payload = soap_doc.format(body=response.payload)
     
-    def set_content_type(self, response, data_format, transport, service_info):
+    def set_content_type(self, response, data_format, transport, url_match):
         """ Sets a response's content type if one hasn't been supplied by the user.
         """
         # A user provided their own content type ..
@@ -327,7 +342,7 @@ class _BaseMessageHandler(object):
             # .. or they did not so let's find out if we're using SimpleIO ..
             if data_format == SIMPLE_IO.FORMAT.XML:
                 if transport == URL_TYPE.SOAP:
-                    if service_info['soap_version'] == '1.1':
+                    if url_match.soap_version == '1.1':
                         content_type = self.server.soap11_content_type
                     else:
                         content_type = self.server.soap12_content_type
@@ -341,58 +356,4 @@ class _BaseMessageHandler(object):
                 
         response.content_type = content_type
     
-    # ##########################################################################
-    
-    def on_broker_msg_CHANNEL_HTTP_SOAP_CREATE_EDIT(self, msg, *args):
-        """ Updates the configuration so that there's a link between a URL
-        and a SOAP method to a service.
-        """
-        old_url_path = msg.get('old_url_path')
-        old_soap_action = msg.get('old_soap_action', '')
-        
-        # A plain HTTP channel has always one SOAP action, the dummy empty one ''
-        # so we can just quickly recreate it from scratch
-        if msg.transport == URL_TYPE.PLAIN_HTTP:
-            soap_action = ''
-            if old_url_path in self.http_soap:
-                del self.http_soap[old_url_path]
-        else:
-            soap_action = msg.soap_action
-            
-            # Delete the old SOAP action if it existed at all and then find out
-            # whether that was the only SOAP action attached to the URL. If it was,
-            # delete the URL as well.
-            if old_url_path in self.http_soap:
-                if old_soap_action in self.http_soap[old_url_path]:
-                    del self.http_soap[old_url_path][old_soap_action]
-                if not self.http_soap[old_url_path]:
-                    del self.http_soap[old_url_path]
-                
-        url_path_bunch = self.http_soap.setdefault(msg.url_path, Bunch())
-        soap_action_bunch = url_path_bunch.setdefault(soap_action, Bunch())
-
-        for name in('id', 'impl_name', 'is_internal', 'method', 'name',
-                    'service_id', 'service_name', 'soap_version', 'url_path'):
-            soap_action_bunch[name] = msg[name]
-            
-    def on_broker_msg_CHANNEL_HTTP_SOAP_DELETE(self, msg, *args):
-        """ Deletes an HTTP/SOAP channel.
-        """
-        if msg.transport == URL_TYPE.PLAIN_HTTP:
-            del self.http_soap[msg.url_path]
-        else:
-            del self.http_soap[msg.url_path][msg.soap_action]
-            if not self.http_soap[msg.url_path]:
-                del self.http_soap[msg.url_path]
-        
-class SOAPHandler(_BaseMessageHandler):
-    """ Dispatches incoming SOAP messages to services.
-    """
-    def __init__(self, http_soap=None, server=None):
-        super(SOAPHandler, self).__init__(http_soap, server)
-
-class PlainHTTPHandler(_BaseMessageHandler):
-    """ Dispatches incoming plain HTTP messages to services.
-    """
-    def __init__(self, http_soap=None, server=None):
-        super(PlainHTTPHandler, self).__init__(http_soap, server)
+# ##########################################################################

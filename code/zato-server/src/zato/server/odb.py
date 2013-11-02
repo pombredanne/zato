@@ -9,7 +9,7 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import logging, threading
+import logging
 from contextlib import closing
 from datetime import datetime, timedelta
 from traceback import format_exc
@@ -24,13 +24,13 @@ from paste.util.multidict import MultiDict
 from bunch import Bunch
 
 # Zato
-from zato.common import DEPLOYMENT_STATUS, ZATO_NONE, ZATO_ODB_POOL_NAME
+from zato.common import DEPLOYMENT_STATUS, MISC, ZATO_NONE, ZATO_ODB_POOL_NAME
 from zato.common.odb.model import Cluster, DeployedService, DeploymentPackage, \
      DeploymentStatus, HTTPBasicAuth, Server, Service, TechnicalAccount, WSSDefinition
 from zato.common.odb.query import channel_amqp, channel_amqp_list, channel_jms_wmq, \
     channel_jms_wmq_list, channel_zmq, channel_zmq_list, def_amqp, def_amqp_list, \
-    def_jms_wmq, def_jms_wmq_list, basic_auth_list,  http_soap_list, http_soap_security_list, \
-    internal_channel_list, job_list,  out_amqp, out_amqp_list, out_ftp, out_ftp_list, \
+    def_jms_wmq, def_jms_wmq_list, basic_auth_list, http_soap_list, http_soap_security_list, \
+    internal_channel_list, job_list, out_amqp, out_amqp_list, out_ftp, out_ftp_list, \
     out_jms_wmq, out_jms_wmq_list, out_sql, out_sql_list, out_zmq, out_zmq_list, tech_acc_list, wss_list
 from zato.common.util import current_host, security_def_type, TRACE1
 from zato.server.connection.sql import SessionWrapper
@@ -63,7 +63,7 @@ class ODBManager(SessionWrapper):
                    one()
             self.cluster = self.server.cluster
             return self.server
-        except Exception, e:
+        except Exception:
             msg = 'Could not find the server in the ODB, token:[{0}]'.format(
                 self.token)
             logger.error(msg)
@@ -75,8 +75,8 @@ class ODBManager(SessionWrapper):
         """
         with closing(self.session()) as session:
             server = session.query(Server).\
-            filter(Server.token==token).\
-            one()
+                filter(Server.token==token).\
+                one()
 
             server.up_status = status
             server.up_mod_date = datetime.utcnow()
@@ -100,7 +100,7 @@ class ODBManager(SessionWrapper):
             'wss': WSSDefinition
             }
 
-        result = MultiDict()
+        result = {}
 
         query = http_soap_security_list(self._session, cluster_id, connection)
         columns = Bunch()
@@ -110,15 +110,15 @@ class ODBManager(SessionWrapper):
             columns[c.name] = None
             
         for item in query.all():
+            target = '{}{}{}'.format(item.soap_action, MISC.SEPARATOR, item.url_path)
             
-            _info = Bunch()
-            _info[item.soap_action] = Bunch()
-            _info[item.soap_action].is_active = item.is_active
-            _info[item.soap_action].transport = item.transport
-            _info[item.soap_action].data_format = item.data_format
+            result[target] = Bunch()
+            result[target].is_active = item.is_active
+            result[target].transport = item.transport
+            result[target].data_format = item.data_format
 
             if item.security_id:
-                _info[item.soap_action].sec_def = Bunch()
+                result[target].sec_def = Bunch()
                 
                 # Will raise KeyError if the DB gets somehow misconfigured.
                 db_class = sec_type_db_class[item.sec_type]
@@ -128,28 +128,26 @@ class ODBManager(SessionWrapper):
                         one()
 
                 # Common things first
-                _info[item.soap_action].sec_def.name = sec_def.name    
-                _info[item.soap_action].sec_def.password = sec_def.password
-                _info[item.soap_action].sec_def.sec_type = item.sec_type
+                result[target].sec_def.name = sec_def.name    
+                result[target].sec_def.password = sec_def.password
+                result[target].sec_def.sec_type = item.sec_type
     
                 if item.sec_type == security_def_type.tech_account:
-                    _info[item.soap_action].sec_def.salt = sec_def.salt
+                    result[target].sec_def.salt = sec_def.salt
                 elif item.sec_type == security_def_type.basic_auth:
-                    _info[item.soap_action].sec_def.username = sec_def.username
-                    _info[item.soap_action].sec_def.password = sec_def.password
-                    _info[item.soap_action].sec_def.realm = sec_def.realm
+                    result[target].sec_def.username = sec_def.username
+                    result[target].sec_def.password = sec_def.password
+                    result[target].sec_def.realm = sec_def.realm
                 elif item.sec_type == security_def_type.wss:
-                    _info[item.soap_action].sec_def.username = sec_def.username
-                    _info[item.soap_action].sec_def.password = sec_def.password
-                    _info[item.soap_action].sec_def.password_type = sec_def.password_type
-                    _info[item.soap_action].sec_def.reject_empty_nonce_creat = sec_def.reject_empty_nonce_creat
-                    _info[item.soap_action].sec_def.reject_stale_tokens = sec_def.reject_stale_tokens
-                    _info[item.soap_action].sec_def.reject_expiry_limit = sec_def.reject_expiry_limit
-                    _info[item.soap_action].sec_def.nonce_freshness_time = sec_def.nonce_freshness_time
+                    result[target].sec_def.username = sec_def.username
+                    result[target].sec_def.password = sec_def.password
+                    result[target].sec_def.password_type = sec_def.password_type
+                    result[target].sec_def.reject_empty_nonce_creat = sec_def.reject_empty_nonce_creat
+                    result[target].sec_def.reject_stale_tokens = sec_def.reject_stale_tokens
+                    result[target].sec_def.reject_expiry_limit = sec_def.reject_expiry_limit
+                    result[target].sec_def.nonce_freshness_time = sec_def.nonce_freshness_time
             else:
-                _info[item.soap_action].sec_def = ZATO_NONE
-                
-            result.add(item.url_path, _info)
+                result[target].sec_def = ZATO_NONE
 
         return result, columns
 
@@ -183,7 +181,7 @@ class ODBManager(SessionWrapper):
     def drop_deployed_services(self, server_id):
         """ Removes all the deployed services from a server.
         """
-        services = self._session.query(DeployedService).\
+        self._session.query(DeployedService).\
             filter(DeployedService.server_id==server_id).\
             delete()
         self._session.commit()
@@ -331,6 +329,13 @@ class ODBManager(SessionWrapper):
     
             session.add(cluster)
             session.commit()
+            
+    def add_delivery(self, deployment_time, details, service, source_info):
+        """ Adds information about the server's deployed service into the ODB.
+        """
+        dp = DeliveryPayload
+        self._session.add(dp)
+        self._session.commit()
 
 # ##############################################################################
 

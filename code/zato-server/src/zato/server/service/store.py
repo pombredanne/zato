@@ -13,7 +13,6 @@ import imp, inspect, logging, os
 from datetime import datetime
 from hashlib import sha256
 from importlib import import_module
-from os.path import getmtime
 from traceback import format_exc
 from uuid import uuid4
 
@@ -28,7 +27,8 @@ try:
     from yaml import CDumper  # Looks awkward but
     Dumper = CDumper          # it's to make import checkers happy
 except ImportError:
-    from yaml import Dumper
+    from yaml import Dumper   # ditto
+    Dumper = Dumper
     
 # Spring Python
 from springpython.context import InitializingObject
@@ -67,7 +67,7 @@ class ServiceStore(InitializingObject):
             hook()
         except Exception:
             msg = 'Error while invoking [%s] on service [%s] ' \
-                ' e:[%s]' % (hook_name, service_name, format_exc())
+                ' e:[%s]' % (hook_name, object_, format_exc())
             logger.error(msg)
 
     def new_instance(self, class_name):
@@ -155,8 +155,14 @@ class ServiceStore(InitializingObject):
             if os.path.exists(path):
                 os.remove(path)
         
-        mod = imp.load_source(mod_name, file_name)
-        self._visit_module(mod, is_internal, file_name)
+        try:
+            mod = imp.load_source(mod_name, file_name)
+        except Exception, e:
+            msg = 'Could not load source mod_name:[{}] file_name:[{}], e:[{}]'.format(
+                mod_name, file_name, format_exc(e))
+            logger.error(msg)
+        else:
+            self._visit_module(mod, is_internal, file_name)
         
     def import_services_from_directory(self, dir_name, base_dir, dist2):
         """ dir_name points to a directory. 
@@ -236,7 +242,6 @@ class ServiceStore(InitializingObject):
                         
                         si = self._get_source_code_info(mod)
                         
-                        last_mod = datetime.fromtimestamp(getmtime(mod.__file__))
                         service_id, is_active, slow_threshold = self.odb.add_service(
                             name, impl_name, is_internal, timestamp, dumps(str(depl_info)), si)
                         

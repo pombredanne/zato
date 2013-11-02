@@ -14,10 +14,10 @@ from springpython.config import Object, PythonConfig
 # Zato
 from zato.common import DEFAULT_STATS_SETTINGS, SIMPLE_IO, ZATO_CRYPTO_WELL_KNOWN_DATA
 from zato.common.crypto import CryptoManager
+from zato.common.delivery import DeliveryStore
 from zato.common.kvdb import KVDB
 from zato.server.base.parallel import ParallelServer
 from zato.server.base.singleton import SingletonServer
-from zato.server.connection.http_soap.security import Security as ConnectionHTTPSOAPSecurity
 from zato.server.connection.sql import PoolStore
 from zato.server.odb import ODBManager
 #from zato.server.pickup import Pickup, PickupEventProcessor
@@ -65,6 +65,8 @@ class ZatoContext(PythonConfig):
             'zato.server.service.internal.outgoing.jms_wmq',
             'zato.server.service.internal.outgoing.sql',
             'zato.server.service.internal.outgoing.zmq',
+            'zato.server.service.internal.pattern.delivery',
+            'zato.server.service.internal.pattern.delivery.definition',
             'zato.server.service.internal.scheduler',
             'zato.server.service.internal.security',
             'zato.server.service.internal.security.basic_auth',
@@ -92,13 +94,13 @@ class ZatoContext(PythonConfig):
     @Object
     def bool_parameter_prefixes(self):
         return SIMPLE_IO.BOOL_PARAMETERS.SUFFIXES
-
+    
     # #######################################################
-    # Security
+    # Delivery store
     
     @Object
-    def connection_http_soap_security(self):
-        return ConnectionHTTPSOAPSecurity()
+    def delivery_store(self):
+        return DeliveryStore(self.kvdb())
 
     # #######################################################
     # SQL
@@ -175,7 +177,7 @@ class ZatoContext(PythonConfig):
         return Scheduler()
 
     @Object
-    def stats_jobs(self):
+    def startup_jobs(self):
         return [
             {'name': 'zato.stats.process-raw-times', 'seconds':90, 
              'service':'zato.stats.process-raw-times', 
@@ -204,6 +206,10 @@ class ZatoContext(PythonConfig):
             
             {'name': 'zato.stats.summary.create-summary-by-year', 'minutes':60,
              'service':'zato.stats.summary.create-summary-by-year'},
-
+            
+            {'name': 'zato.pattern.delivery.update-counters', 'seconds':30,
+             'service':'zato.pattern.delivery.update-counters'},
+            
+            {'name': 'zato.pattern.delivery.dispatch-auto-resubmit', 'seconds':300,
+             'service':'zato.pattern.delivery.dispatch-auto-resubmit'},
         ]
-

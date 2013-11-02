@@ -10,12 +10,13 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 from unittest import TestCase
+from uuid import uuid4
 
 # anyjson
 from anyjson import dumps, loads
 
 # lxml
-from lxml import etree, objectify
+from lxml import etree
 
 # nose
 from nose.tools import eq_
@@ -24,8 +25,8 @@ from nose.tools import eq_
 from zato.common import common_namespaces, ZATO_OK
 from zato.common.test import rand_bool, rand_int, rand_object, rand_string
 from zato.common.util import new_cid
-from zato.client import AnyServiceInvoker, CID_NO_CLIP, JSONClient, JSONSIOClient, \
-     RawDataClient, _Response, SOAPClient, SOAPSIOClient,  _StructuredResponse, XMLClient
+from zato.client import AnyServiceInvoker, CID_NO_CLIP, _Client, JSONClient, JSONSIOClient, \
+     RawDataClient, _Response, SOAPClient, SOAPSIOClient, _StructuredResponse, XMLClient
 
 # ##############################################################################
 
@@ -37,8 +38,9 @@ class FakeInnerResponse(object):
         self.status_code = status_code
 
 class FakeSession(object):
-    def __init__(self, response=None):
+    def __init__(self, response=None, auth=None):
         self.response = response
+        self.auth = auth
         
     def post(self, address, request, headers):
         return self.response
@@ -61,7 +63,8 @@ class _Base(TestCase):
     def get_client(self, response):
         self.session.response = response
         
-        return self.client_class(self.url, self.auth, self.path, self.session,
+        return self.client_class(
+            self.url, self.auth, self.path, self.session,
             self.to_bunch, self.max_response_repr, self.max_cid_repr)
 
 # ##############################################################################
@@ -394,3 +397,23 @@ class TestResponse(TestCase):
                 ok, status_code, cid[:max_cid_repr], cid_ellipsis, cid[-max_cid_repr:], text[:max_response_repr])
             
             eq_(repr(response).endswith(expected), True)
+
+class TestSettingSessionAuth(TestCase):
+    def test_setting_session_auth_no_previous_auth(self):
+        auth = (uuid4().hex, uuid4().hex)
+        client = _Client(uuid4().hex, uuid4().hex, auth)
+        
+        self.assertEqual(client.session.auth, auth)
+        
+    def test_setting_session_auth_has_previous_auth(self):
+        auth1 = (uuid4().hex, uuid4().hex)
+        auth2 = (uuid4().hex, uuid4().hex)
+        
+        session = FakeSession(uuid4, auth1)
+        client = _Client(uuid4().hex, uuid4().hex, auth2, session=session)
+        
+        # Make sure we don't override already existing auth
+        self.assertNotEqual(client.session.auth, auth2)
+        
+        # The previous auth should still be there
+        self.assertEqual(client.session.auth, auth1)

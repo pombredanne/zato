@@ -9,12 +9,13 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-from random import choice, randint
+from datetime import datetime
+from random import choice, randint, random
 from unittest import TestCase
 from uuid import uuid4
 
 # anyjson
-from anyjson import dumps, loads
+from anyjson import loads
 
 # Bunch
 from bunch import Bunch
@@ -25,12 +26,20 @@ from mock import MagicMock, Mock
 # nose
 from nose.tools import eq_
 
+# SQLAlchemy
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 # Zato
 from zato.common import CHANNEL, SIMPLE_IO
+from zato.common.odb import model
 from zato.common.util import new_cid
 
 def rand_bool():
     return choice((True, False))
+
+def rand_datetime():
+    return datetime.utcnow().isoformat() # Random in the sense of not repeating
 
 def rand_int(start=1, stop=100):
     return randint(start, stop)
@@ -64,11 +73,28 @@ class FakeBrokerClient(object):
         raise NotImplementedError()
 
 class FakeKVDB(object):
+
     class FakeConn(object):
+        def __init__(self):
+            self.setnx_args = None
+            self.setnx_return_value = True
+            self.expire_args = None
+            self.delete_args = None
+            
         def return_none(self, *ignored_args, **ignored_kwargs):
             return None
         
         get = hget = return_none
+        
+        def setnx(self, *args):
+            self.setnx_args = args
+            return self.setnx_return_value
+        
+        def expire(self, *args):
+            self.expire_args = args
+            
+        def delete(self, args):
+            self.delete_args = args
         
     def __init__(self):
         self.conn = self.FakeConn()
@@ -94,6 +120,7 @@ class FakeServer(object):
         self.fs_server_config.misc = Bunch()
         self.fs_server_config.misc.internal_services_may_be_deleted = False
         self.repo_location = rand_string()
+        self.delivery_store = None
 
 class ForceTypeWrapper(object):
     """ Makes comparison between two ForceType elements use their names.
@@ -121,7 +148,8 @@ class ServiceTestCase(TestCase):
             'bool_parameter_prefixes': SIMPLE_IO.BOOL_PARAMETERS.SUFFIXES,
         }
         
-        class_.update(instance, channel, FakeServer(), None, worker_store, new_cid(), request_data, request_data, 
+        class_.update(
+            instance, channel, FakeServer(), None, worker_store, new_cid(), request_data, request_data,
             simple_io_config=simple_io_config, data_format=SIMPLE_IO.FORMAT.JSON, job_type=job_type)
 
         def get_data(self, *ignored_args, **ignored_kwargs):
@@ -155,21 +183,32 @@ class ServiceTestCase(TestCase):
     def _check_sio_request_input(self, instance, request_data):
         for k, v in request_data.iteritems():
             self.assertEquals(getattr(instance.request.input, k), v)
+
+        sio_keys = set(getattr(instance.SimpleIO, 'input_required', []))
+        sio_keys.update(set(getattr(instance.SimpleIO, 'input_optional', [])))
+        given_keys = set(request_data.keys())
+        
+        diff = sio_keys ^ given_keys
+        self.assertFalse(diff, 'There should be no difference between sio_keys {} and given_keys {}, diff {}'.format(
+            sio_keys, given_keys, diff))
     
     def check_impl(self, service_class, request_data, response_data, response_elem, mock_data={}):
+
+        expected_data = sorted(response_data.items())
         
-        expected_keys = response_data.keys()
-        expected_data = tuple(response_data for x in range(rand_int(10)))
-        expected = Expected()
-        
-        instance = self.invoke(service_class, request_data, expected, mock_data)
-        if not isinstance(instance.response.payload, basestring):
-            loads(instance.response.payload.getvalue())[response_elem] # Raises KeyError if 'response_elem' doesn't match
-        
+        instance = self.invoke(service_class, request_data, None, mock_data)
         self._check_sio_request_input(instance, request_data)
+        
+        if response_data:
+            if not isinstance(instance.response.payload, basestring):
+                response = loads(instance.response.payload.getvalue())[response_elem] # Raises KeyError if 'response_elem' doesn't match
+            else:
+                response = loads(instance.response.payload)[response_elem]
+                
+            self.assertEqual(sorted(response.items()), expected_data)
     
-    def check_impl_list(self, service_class, item_class, request_data, 
-        response_data, request_elem, response_elem, mock_data={}):
+    def check_impl_list(self, service_class, item_class, request_data, # noqa
+            response_data, request_elem, response_elem, mock_data={}): # noqa
         
         expected_keys = response_data.keys()
         expected_data = tuple(response_data for x in range(rand_int(10)))
@@ -198,3 +237,14 @@ class ServiceTestCase(TestCase):
 
     def wrap_force_type(self, elem):
         return ForceTypeWrapper(elem)
+
+class ODBTestCase(TestCase):
+
+    def setUp(self):
+        self.engine = create_engine('sqlite:///:memory:')
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        model.Base.metadata.create_all(self.engine)
+        
+    def tearDown(self):
+        model.Base.metadata.drop_all(self.engine)

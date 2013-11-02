@@ -9,11 +9,10 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import asyncore, logging, os, time
+import logging, os, time
 from datetime import datetime
 from httplib import INTERNAL_SERVER_ERROR, responses
-from threading import currentThread, Thread
-from time import sleep
+from threading import Thread
 from traceback import format_exc
 from uuid import uuid4
 
@@ -23,7 +22,11 @@ from anyjson import dumps
 # Bunch
 from bunch import Bunch
 
+# parse
+from parse import compile as parse_compile
+
 # Paste
+from paste.util.converters import asbool
 from paste.util.multidict import MultiDict
 
 # Spring Python
@@ -34,9 +37,11 @@ from retools.lock import Lock
 
 # Zato
 from zato.broker.client import BrokerClient
-from zato.common import KVDB, SERVER_JOIN_STATUS, SERVER_UP_STATUS, ZATO_ODB_POOL_NAME
-from zato.common.broker_message import AMQP_CONNECTOR, code_to_name, HOT_DEPLOY, JMS_WMQ_CONNECTOR, MESSAGE_TYPE, TOPICS, ZMQ_CONNECTOR
-from zato.common.util import clear_locks, new_cid
+from zato.common import CHANNEL, KVDB, MISC, SERVER_JOIN_STATUS, SERVER_UP_STATUS,\
+     ZATO_ODB_POOL_NAME
+from zato.common.broker_message import AMQP_CONNECTOR, code_to_name, HOT_DEPLOY,\
+     JMS_WMQ_CONNECTOR, MESSAGE_TYPE, SERVICE, TOPICS, ZMQ_CONNECTOR
+from zato.common.util import add_startup_jobs, new_cid
 from zato.server.base import BrokerMessageReceiver
 from zato.server.base.worker import WorkerStore
 from zato.server.config import ConfigDict, ConfigStore
@@ -47,7 +52,6 @@ from zato.server.connection.jms_wmq.outgoing import start_connector as jms_wmq_o
 from zato.server.connection.zmq_.channel import start_connector as zmq_channel_start_connector
 from zato.server.connection.zmq_.outgoing import start_connector as zmq_outgoing_start_connector
 from zato.server.pickup import get_pickup
-from zato.server.stats import add_stats_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +85,13 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
         self.name = None
         self.cluster_id = None
         self.kvdb = None
-        self.stats_jobs = None
+        self.startup_jobs = None
         self.worker_store = None
         self.deployment_lock_expires = None
         self.deployment_lock_timeout = None
         self.app_context = None
         self.has_gevent = None
+        self.delivery_store = None
         
         # The main config store
         self.config = ConfigStore()
@@ -103,7 +108,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
         # Any exception at this point must be our fault
         except Exception, e:
             tb = format_exc(e)
-            status = b'{} {}'.format(INTERNAL_SERVER_ERROR, responses[INTERNAL_SERVER_ERROR])
+            wsgi_environ['zato.http.response.status'] = b'{} {}'.format(INTERNAL_SERVER_ERROR, responses[INTERNAL_SERVER_ERROR])
             error_msg = b'[{0}] Exception caught [{1}]'.format(cid, tb)
             logger.error(error_msg)
             payload = error_msg
@@ -132,7 +137,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
                 self.service_sources, self.base_dir)
             
             # Add the statistics-related scheduler jobs to the ODB
-            add_stats_jobs(self.cluster_id, self.odb, self.stats_jobs)
+            add_startup_jobs(self.cluster_id, self.odb, self.startup_jobs)
             
         lock_name = '{}{}:{}'.format(KVDB.LOCK_SERVER_STARTING, self.fs_server_config.main.token, deployment_key)
         already_deployed_flag = '{}{}:{}'.format(KVDB.LOCK_SERVER_ALREADY_DEPLOYED, 
@@ -193,21 +198,26 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
             name = name.strip()
             if name and not name.startswith('#'):
                 self.service_sources.append(name)
-        
+                
         # Normalize hot-deploy configuration
         self.hot_deploy_config = Bunch()
+        
         self.hot_deploy_config.work_dir = os.path.normpath(os.path.join(
             self.repo_location, self.fs_server_config.hot_deploy.work_dir))
+
         self.hot_deploy_config.backup_history = int(self.fs_server_config.hot_deploy.backup_history)
         self.hot_deploy_config.backup_format = self.fs_server_config.hot_deploy.backup_format
-        self.hot_deploy_config.current_work_dir = os.path.normpath(os.path.join(
-            self.hot_deploy_config.work_dir, self.fs_server_config.hot_deploy.current_work_dir))
-        self.hot_deploy_config.backup_work_dir = os.path.normpath(os.path.join(
-            self.hot_deploy_config.work_dir, self.fs_server_config.hot_deploy.backup_work_dir))
-        self.hot_deploy_config.last_backup_work_dir = os.path.normpath(
-            os.path.join(
-                self.hot_deploy_config.work_dir, self.fs_server_config.hot_deploy.last_backup_work_dir))
-        
+
+        for name in('current_work_dir', 'backup_work_dir', 'last_backup_work_dir', 'delete_after_pick_up'):
+
+            # New in 1.2
+            if name == 'delete_after_pick_up':
+                value = asbool(self.fs_server_config.hot_deploy.get(name, True))
+                self.hot_deploy_config[name] = value
+            else:
+                self.hot_deploy_config[name] = os.path.normpath(os.path.join(
+                  self.hot_deploy_config.work_dir, self.fs_server_config.hot_deploy[name]))
+            
         is_first = self.maybe_on_first_worker(server, self.kvdb.conn, deployment_key)
         
         broker_callbacks = {
@@ -219,7 +229,6 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
             broker_callbacks[TOPICS[MESSAGE_TYPE.TO_SINGLETON]] = self.on_broker_msg_singleton
         
         self.broker_client = BrokerClient(self.kvdb, 'parallel', broker_callbacks)
-        self.broker_client.start()
         
         if is_first:
             
@@ -243,9 +252,11 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
             # Let the scheduler fully initialize
             self.singleton_server.scheduler.wait_for_init()
             self.singleton_server.server_id = server.id
-    
+            
+        return is_first
+                        
     def _after_init_accepted(self, server, deployment_key):
-        
+
         if self.singleton_server:
 
             # Let's see if we can become a connector server, the one to start all
@@ -254,12 +265,12 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
                 self.fs_server_config.singleton.connector_server_keep_alive_job_time)
             self.connector_server_grace_time = int(
                 self.fs_server_config.singleton.grace_time_multiplier) * self.connector_server_keep_alive_job_time
-            
+
             if self.singleton_server.become_cluster_wide(
-                self.connector_server_keep_alive_job_time, self.connector_server_grace_time, 
-                server.id, server.cluster_id, True):
+                    self.connector_server_keep_alive_job_time, self.connector_server_grace_time, 
+                    server.id, server.cluster_id, True):
                 self.init_connectors()
-                
+
                 for(_, name, is_active, job_type, start_date, extra, service_name, _,
                     _, weeks, days, hours, minutes, seconds, repeats, cron_definition)\
                         in self.odb.get_job_list(server.cluster.id):
@@ -268,7 +279,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
                             'job_type':job_type, 'start_date':start_date, 
                             'extra':extra, 'service':service_name, 'weeks':weeks, 
                             'days':days, 'hours':hours, 'minutes':minutes, 
-                            'seconds':seconds,  'repeats':repeats, 
+                            'seconds':seconds, 'repeats':repeats,
                             'cron_definition':cron_definition})
                         self.singleton_server.scheduler.create_edit('create', job_data)
                 
@@ -324,28 +335,18 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
         query = self.odb.get_wss_list(server.cluster.id, True)
         self.config.wss = ConfigDict.from_query('wss', query)
         
-        # Security configuration of HTTP URLs
-        #self.config.url_sec = self.odb.get_url_security(server.cluster.id)
-        
         # All the HTTP/SOAP channels.
-        http_soap = MultiDict()
+        http_soap = []
         for item in self.odb.get_http_soap_list(server.cluster.id, 'channel'):
-            _info = Bunch()
-            _info[item.soap_action] = Bunch()
-            _info[item.soap_action].id = item.id
-            _info[item.soap_action].name = item.name
-            _info[item.soap_action].is_active = item.is_active
-            _info[item.soap_action].is_internal = item.is_internal
-            _info[item.soap_action].url_path = item.url_path
-            _info[item.soap_action].method = item.method
-            _info[item.soap_action].soap_version = item.soap_version
-            _info[item.soap_action].service_id = item.service_id
-            _info[item.soap_action].service_name = item.service_name
-            _info[item.soap_action].impl_name = item.impl_name
-            _info[item.soap_action].data_format = item.data_format
-            _info[item.soap_action].transport = item.transport
-            _info[item.soap_action].connection = item.connection
-            http_soap.add(item.url_path, _info)
+            
+            hs_item = Bunch()
+            for key in item.keys():
+                hs_item[key] = getattr(item, key)
+                
+            hs_item.match_target = '{}{}{}'.format(hs_item.soap_action, MISC.SEPARATOR, hs_item.url_path)
+            hs_item.match_target_compiled = parse_compile(hs_item.match_target)
+                
+            http_soap.append(hs_item)
             
         self.config.http_soap = http_soap
         
@@ -443,6 +444,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
         odb_data.engine = parallel_server.odb_data['engine']
         odb_data.extra = parallel_server.odb_data['extra']
         odb_data.host = parallel_server.odb_data['host']
+        odb_data.port = parallel_server.odb_data['port']
         odb_data.password = parallel_server.crypto_manager.decrypt(parallel_server.odb_data['password'])
         odb_data.pool_size = parallel_server.odb_data['pool_size']
         odb_data.username = parallel_server.odb_data['username']
@@ -460,6 +462,49 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
         self.sql_pool_store[ZATO_ODB_POOL_NAME] = self.config.odb_data
         self.odb.pool = self.sql_pool_store[ZATO_ODB_POOL_NAME].pool
         self.odb.token = self.config.odb_data.token
+        
+    def _startup_service_payload_from_path(self, name, value, repo_location):
+        """ Reads payload from a local file. Abstracted out to ease in testing.
+        """
+        orig_path = value.replace('file://', '')
+        if not os.path.isabs(orig_path):
+            path = os.path.normpath(os.path.join(repo_location, orig_path))
+        else:
+            path = orig_path
+            
+        try:
+            payload = open(path).read()
+        except Exception, e:
+            msg = 'Could not open payload path:[{}] [{}], skipping startup service:[{}], e:[{}]'.format(
+                orig_path, path, name, format_exc(e))
+            logger.warn(msg)
+        else:
+            return payload
+        
+    def invoke_startup_services(self):
+        """ We are the first worker and we know we have a broker client and all the other config ready
+        so we can publish the request to execute startup services. In the worst
+        case the requests will get back to us but it's also possible that other 
+        workers are already running. In short, there is no guarantee that any
+        server or worker in particular will receive the requests, only that there
+        will be exactly one.
+        """
+        for name, payload in self.fs_server_config.get('startup_services', {}).items():
+            if payload.startswith('file://'):
+                payload = self._startup_service_payload_from_path(name, payload, self.repo_location)
+                if not payload:
+                    continue
+
+            cid = new_cid()
+                
+            msg = {}
+            msg['action'] = SERVICE.PUBLISH
+            msg['service'] = name
+            msg['payload'] = payload
+            msg['cid'] = cid
+            msg['channel'] = CHANNEL.STARTUP_SERVICE
+                
+            self.broker_client.invoke_async(msg)
     
     @staticmethod
     def post_fork(arbiter, worker):
@@ -482,7 +527,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
         parallel_server.name = server.name
         parallel_server.cluster_id = server.cluster_id
 
-        parallel_server._after_init_common(server, arbiter.zato_deployment_key)
+        is_first = parallel_server._after_init_common(server, arbiter.zato_deployment_key)
         
         # For now, all the servers are always ACCEPTED but future versions
         # might introduce more join states
@@ -496,6 +541,14 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver):
             
         parallel_server.odb.server_up_down(server.token, SERVER_UP_STATUS.RUNNING, True,
             parallel_server.host, parallel_server.port)
+        
+        parallel_server.delivery_store = parallel_server.app_context.get_object('delivery_store')
+        parallel_server.delivery_store.broker_client = parallel_server.broker_client
+        parallel_server.delivery_store.odb = parallel_server.odb
+        parallel_server.delivery_store.delivery_lock_timeout = float(parallel_server.fs_server_config.misc.delivery_lock_timeout)
+        
+        if is_first:
+            parallel_server.invoke_startup_services()
         
     @staticmethod
     def on_starting(arbiter):

@@ -19,7 +19,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import backref, relationship
 
 # Zato
-from zato.common import SCHEDULER_JOB_TYPE
+from zato.common import INVOCATION_TARGET, SCHEDULER_JOB_TYPE
 from zato.common.odb import AMQP_DEFAULT_PRIORITY, WMQ_DEFAULT_PRIORITY
 
 Base = declarative_base()
@@ -44,7 +44,7 @@ class ZatoInstallState(Base):
     """
     __tablename__ = 'install_state'
 
-    id = Column(Integer,  Sequence('install_state_seq'), primary_key=True)
+    id = Column(Integer, Sequence('install_state_seq'), primary_key=True)
     version = Column(Integer, unique=True, nullable=False)
     install_time = Column(DateTime(), nullable=False)
     source_host = Column(String(200), nullable=False)
@@ -63,7 +63,7 @@ class Cluster(Base):
     """
     __tablename__ = 'cluster'
 
-    id = Column(Integer,  Sequence('cluster_id_seq'), primary_key=True)
+    id = Column(Integer, Sequence('cluster_id_seq'), primary_key=True)
     name = Column(String(200), unique=True, nullable=False)
     description = Column(String(1000), nullable=True)
     odb_type = Column(String(30), nullable=False)
@@ -82,7 +82,7 @@ class Cluster(Base):
 
     def __init__(self, id=None, name=None, description=None, odb_type=None,
                  odb_host=None, odb_port=None, odb_user=None, odb_db_name=None,
-                 odb_schema=None, broker_host=None, 
+                 odb_schema=None, broker_host=None,
                  broker_port=None, lb_host=None, lb_port=None,
                  lb_agent_port=None, cw_srv_id=None, cw_srv_keep_alive_dt=None):
         self.id = id
@@ -111,7 +111,7 @@ class Server(Base):
     __tablename__ = 'server'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('server_id_seq'), primary_key=True)
+    id = Column(Integer, Sequence('server_id_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     host = Column(String(400), nullable=True)
     
@@ -158,13 +158,13 @@ class SecurityBase(Base):
     __table_args__ = (UniqueConstraint('cluster_id', 'name'), {})
     __mapper_args__ = {'polymorphic_on': 'sec_type'}
     
-    id = Column(Integer,  Sequence('sec_base_seq'), primary_key=True)
+    id = Column(Integer, Sequence('sec_base_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     
     # It's nullable because TechnicalAccount doesn't use usernames
-    username = Column(String(200), nullable=True) 
+    username = Column(String(200), nullable=True)
     
-    password = Column(String(64), nullable=False)
+    password = Column(String(64), nullable=True)
     password_type = Column(String(45), nullable=True)
     is_active = Column(Boolean(), nullable=False)
     sec_type = Column(String(45), nullable=False)
@@ -174,7 +174,7 @@ class SecurityBase(Base):
 
 class HTTPBasicAuth(SecurityBase):
     """ An HTTP Basic Auth definition.
-    """    
+    """
     __tablename__ = 'sec_basic_auth'
     __mapper_args__ = {'polymorphic_identity': 'basic_auth'}
     
@@ -250,7 +250,7 @@ class HTTPSOAP(Base):
     __table_args__ = (UniqueConstraint('name', 'connection', 'transport', 'cluster_id'),
                       UniqueConstraint('url_path', 'connection', 'soap_action', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('http_soap_seq'), primary_key=True)
+    id = Column(Integer, Sequence('http_soap_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
     is_internal = Column(Boolean(), nullable=False)
@@ -266,6 +266,21 @@ class HTTPSOAP(Base):
     soap_version = Column(String(20), nullable=True)
     
     data_format = Column(String(20), nullable=True)
+
+    # New in 1.2
+    ping_method = Column(String(60), nullable=True)
+    
+    # New in 1.2
+    pool_size = Column(Integer, nullable=True)
+    
+    # New in 1.2
+    merge_url_params_req = Column(Boolean, nullable=True, default=True)
+
+    # New in 1.2
+    url_params_pri = Column(String(200), nullable=True, default='path-over-qs')
+    
+    # New in 1.2
+    params_pri = Column(String(200), nullable=True, default='channel-params-over-msg')
     
     service_id = Column(Integer, ForeignKey('service.id', ondelete='CASCADE'), nullable=True)
     service = relationship('Service', backref=backref('http_soap', order_by=name, cascade='all, delete, delete-orphan'))
@@ -276,11 +291,12 @@ class HTTPSOAP(Base):
     security_id = Column(Integer, ForeignKey('sec_base.id', ondelete='CASCADE'), nullable=True)
     security = relationship(SecurityBase, backref=backref('http_soap_list', order_by=name, cascade='all, delete, delete-orphan'))
     
-    def __init__(self, id=None, name=None, is_active=None, is_internal=None, 
-                 connection=None, transport=None, host=None, url_path=None, method=None, 
-                 soap_action=None, soap_version=None, data_format=None, service_id=None, service=None,
-                 security=None, cluster_id=None, cluster=None, service_name=None,
-                 security_id=None, security_name=None):
+    def __init__(self, id=None, name=None, is_active=None, is_internal=None,
+                 connection=None, transport=None, host=None, url_path=None, method=None,
+                 soap_action=None, soap_version=None, data_format=None, ping_method=None,
+                 pool_size=None, merge_url_params_req=None, url_params_pri=None,
+                 params_pri=None, service_id=None, service=None, security=None, cluster_id=None,
+                 cluster=None, service_name=None, security_id=None, security_name=None):
         self.id = id
         self.name = name
         self.is_active = is_active
@@ -293,6 +309,11 @@ class HTTPSOAP(Base):
         self.soap_action = soap_action
         self.soap_version = soap_version
         self.data_format = data_format
+        self.ping_method = ping_method
+        self.pool_size = pool_size
+        self.merge_url_params_req = merge_url_params_req
+        self.url_params_pri = url_params_pri
+        self.params_pri = params_pri
         self.service_id = service_id
         self.service = service
         self.security = security
@@ -301,7 +322,7 @@ class HTTPSOAP(Base):
         self.service_name = service_name # Not used by the DB
         self.security_id = security_id
         self.security_name = security_name
-
+        
 ################################################################################
 
 class SQLConnectionPool(Base):
@@ -310,7 +331,7 @@ class SQLConnectionPool(Base):
     __tablename__ = 'sql_pool'
     __table_args__ = (UniqueConstraint('cluster_id', 'name'), {})
 
-    id = Column(Integer,  Sequence('sql_pool_id_seq'), primary_key=True)
+    id = Column(Integer, Sequence('sql_pool_id_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
     username = Column(String(200), nullable=False)
@@ -327,8 +348,8 @@ class SQLConnectionPool(Base):
     
     engine_text = None # For auto-completion, not used by the DB
 
-    def __init__(self, id=None, name=None, is_active=None, db_name=None, 
-                 username=None, engine=None, extra=None, host=None, port=None, 
+    def __init__(self, id=None, name=None, is_active=None, db_name=None,
+                 username=None, engine=None, extra=None, host=None, port=None,
                  pool_size=None, cluster=None):
         self.id = id
         self.name = name
@@ -350,20 +371,20 @@ class Service(Base):
     __tablename__ = 'service'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('service_id_seq'), primary_key=True)
-    name = Column(String(2000), nullable=False)
+    id = Column(Integer, Sequence('service_id_seq'), primary_key=True)
+    name = Column(String(300), nullable=False)
     is_active = Column(Boolean(), nullable=False)
     impl_name = Column(String(2000), nullable=False)
     is_internal = Column(Boolean(), nullable=False)
     wsdl = Column(LargeBinary(5000000), nullable=True)
     wsdl_name = Column(String(200), nullable=True)
     
-    slow_threshold = Column(Integer,  nullable=False, default=99999)
+    slow_threshold = Column(Integer, nullable=False, default=99999)
     
     cluster_id = Column(Integer, ForeignKey('cluster.id', ondelete='CASCADE'), nullable=False)
     cluster = relationship(Cluster, backref=backref('services', order_by=name, cascade='all, delete, delete-orphan'))
 
-    def __init__(self, id=None, name=None, is_active=None, impl_name=None, 
+    def __init__(self, id=None, name=None, is_active=None, impl_name=None,
                  is_internal=None, cluster=None, wsdl=None, wsdl_name=None):
         self.id = id
         self.name = name
@@ -444,7 +465,7 @@ class Job(Base):
     __tablename__ = 'job'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('job_id_seq'), primary_key=True)
+    id = Column(Integer, Sequence('job_id_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
     job_type = Column(Enum(SCHEDULER_JOB_TYPE.ONE_TIME, SCHEDULER_JOB_TYPE.INTERVAL_BASED,
@@ -484,7 +505,7 @@ class IntervalBasedJob(Base):
     __tablename__ = 'job_interval_based'
     __table_args__ = (UniqueConstraint('job_id'), {})
 
-    id = Column(Integer,  Sequence('job_intrvl_seq'), primary_key=True)
+    id = Column(Integer, Sequence('job_intrvl_seq'), primary_key=True)
     job_id = Column(Integer, nullable=False)
 
     weeks = Column(Integer, nullable=True)
@@ -515,7 +536,7 @@ class CronStyleJob(Base):
     __tablename__ = 'job_cron_style'
     __table_args__ = (UniqueConstraint('job_id'), {})
 
-    id = Column(Integer,  Sequence('job_cron_seq'), primary_key=True)
+    id = Column(Integer, Sequence('job_cron_seq'), primary_key=True)
     cron_definition = Column(String(4000), nullable=False)
 
     job_id = Column(Integer, ForeignKey('job.id', ondelete='CASCADE'), nullable=False)
@@ -534,7 +555,7 @@ class ConnDefAMQP(Base):
     __tablename__ = 'conn_def_amqp'
     __table_args__ = (UniqueConstraint('name', 'cluster_id', 'def_type'), {})
 
-    id = Column(Integer,  Sequence('conn_def_amqp_seq'), primary_key=True)
+    id = Column(Integer, Sequence('conn_def_amqp_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     # TODO is_active = Column(Boolean(), nullable=False)
     
@@ -551,7 +572,7 @@ class ConnDefAMQP(Base):
     cluster = relationship(Cluster, backref=backref('amqp_conn_defs', order_by=name, cascade='all, delete, delete-orphan'))
 
     def __init__(self, id=None, name=None, def_type=None, host=None, port=None,
-                 vhost=None,  username=None,  password=None, frame_max=None,
+                 vhost=None, username=None, password=None, frame_max=None,
                  heartbeat=None, cluster_id=None):
         self.id = id
         self.name = name
@@ -571,7 +592,7 @@ class ConnDefWMQ(Base):
     __tablename__ = 'conn_def_wmq'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('conn_def_wmq_seq'), primary_key=True)
+    id = Column(Integer, Sequence('conn_def_wmq_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     # TODO is_active = Column(Boolean(), nullable=False)
 
@@ -594,7 +615,7 @@ class ConnDefWMQ(Base):
 
     def __init__(self, id=None, name=None, host=None, port=None,
                  queue_manager=None, channel=None, cache_open_send_queues=None,
-                 cache_open_receive_queues=None,  use_shared_connections=None, ssl=None,
+                 cache_open_receive_queues=None, use_shared_connections=None, ssl=None,
                  ssl_cipher_spec=None, ssl_key_repository=None, needs_mcd=None,
                  max_chars_printed=None, cluster_id=None):
         self.id = id
@@ -621,7 +642,7 @@ class OutgoingAMQP(Base):
     __tablename__ = 'out_amqp'
     __table_args__ = (UniqueConstraint('name', 'def_id'), {})
 
-    id = Column(Integer,  Sequence('out_amqp_seq'), primary_key=True)
+    id = Column(Integer, Sequence('out_amqp_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
 
@@ -661,7 +682,7 @@ class OutgoingFTP(Base):
     __tablename__ = 'out_ftp'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('out_ftp_seq'), primary_key=True)
+    id = Column(Integer, Sequence('out_ftp_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
 
@@ -676,7 +697,7 @@ class OutgoingFTP(Base):
     cluster_id = Column(Integer, ForeignKey('cluster.id', ondelete='CASCADE'), nullable=False)
     cluster = relationship(Cluster, backref=backref('out_conns_ftp', order_by=name, cascade='all, delete, delete-orphan'))
 
-    def __init__(self, id=None, name=None, is_active=None, host=None, user=None, 
+    def __init__(self, id=None, name=None, is_active=None, host=None, user=None,
                  password=None, acct=None, timeout=None, port=None, dircache=None,
                  cluster_id=None):
         self.id = id
@@ -697,7 +718,7 @@ class OutgoingWMQ(Base):
     __tablename__ = 'out_wmq'
     __table_args__ = (UniqueConstraint('name', 'def_id'), {})
 
-    id = Column(Integer,  Sequence('out_wmq_seq'), primary_key=True)
+    id = Column(Integer, Sequence('out_wmq_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
 
@@ -727,7 +748,7 @@ class OutgoingZMQ(Base):
     __tablename__ = 'out_zmq'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('out_zmq_seq'), primary_key=True)
+    id = Column(Integer, Sequence('out_zmq_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
 
@@ -754,7 +775,7 @@ class ChannelAMQP(Base):
     __tablename__ = 'channel_amqp'
     __table_args__ = (UniqueConstraint('name', 'def_id'), {})
 
-    id = Column(Integer,  Sequence('channel_amqp_seq'), primary_key=True)
+    id = Column(Integer, Sequence('channel_amqp_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
     queue = Column(String(200), nullable=False)
@@ -786,7 +807,7 @@ class ChannelWMQ(Base):
     __tablename__ = 'channel_wmq'
     __table_args__ = (UniqueConstraint('name', 'def_id'), {})
 
-    id = Column(Integer,  Sequence('channel_wmq_seq'), primary_key=True)
+    id = Column(Integer, Sequence('channel_wmq_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
     queue = Column(String(200), nullable=False)
@@ -815,7 +836,7 @@ class ChannelZMQ(Base):
     __tablename__ = 'channel_zmq'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
 
-    id = Column(Integer,  Sequence('channel_zmq_seq'), primary_key=True)
+    id = Column(Integer, Sequence('channel_zmq_seq'), primary_key=True)
     name = Column(String(200), nullable=False)
     is_active = Column(Boolean(), nullable=False)
 
@@ -847,7 +868,7 @@ class DeploymentPackage(Base):
     """
     __tablename__ = 'deployment_package'
     
-    id = Column(Integer,  Sequence('depl_package_seq'), primary_key=True)
+    id = Column(Integer, Sequence('depl_package_seq'), primary_key=True)
     deployment_time = Column(DateTime(), nullable=False)
     details = Column(String(2000), nullable=False)
     
@@ -870,7 +891,7 @@ class DeploymentStatus(Base):
     __tablename__ = 'deployment_status'
     __table_args__ = (UniqueConstraint('package_id', 'server_id'), {})
 
-    id = Column(Integer,  Sequence('depl_status_seq'), primary_key=True)    
+    id = Column(Integer, Sequence('depl_status_seq'), primary_key=True)
     
     package_id = Column(Integer, ForeignKey('deployment_package.id', ondelete='CASCADE'), nullable=False, primary_key=False)
     package = relationship(DeploymentPackage, backref=backref('deployment_status_list', order_by=package_id, cascade='all, delete, delete-orphan'))
@@ -887,3 +908,98 @@ class DeploymentStatus(Base):
         self.server_id = server_id
         self.status = status
         self.status_change_time = status_change_time
+
+################################################################################
+
+class DeliveryDefinitionBase(Base):
+    """ A guaranteed delivery's definition (base class).
+    """
+    __tablename__ = 'delivery_def_base'
+    __mapper_args__ = {'polymorphic_on': 'target_type'}
+    
+    id = Column(Integer, Sequence('deliv_def_seq'), primary_key=True)
+    name = Column(String(200), nullable=False, index=True)
+    short_def = Column(String(200), nullable=False)
+    last_used = Column(DateTime(), nullable=True)
+    
+    target_type = Column(String(200), nullable=False)
+    callback_list = Column(LargeBinary(10000), nullable=True)
+    
+    expire_after = Column(Integer, nullable=False)
+    expire_arch_succ_after = Column(Integer, nullable=False)
+    expire_arch_fail_after = Column(Integer, nullable=False)
+    check_after = Column(Integer, nullable=False)
+    retry_repeats = Column(Integer, nullable=False)
+    retry_seconds = Column(Integer, nullable=False)
+    
+    cluster_id = Column(Integer, ForeignKey('cluster.id', ondelete='CASCADE'), nullable=False)
+    cluster = relationship(Cluster, backref=backref('delivery_list', order_by=name, cascade='all, delete, delete-orphan'))
+
+class DeliveryDefinitionOutconnWMQ(DeliveryDefinitionBase):
+    """ A guaranteed delivery's definition (outgoing WebSphere MQ connections).
+    """
+    __tablename__ = 'delivery_def_out_wmq'
+    __mapper_args__ = {'polymorphic_identity': INVOCATION_TARGET.OUTCONN_WMQ}
+    
+    id = Column(Integer, ForeignKey('delivery_def_base.id'), primary_key=True)
+    target_id = Column(Integer, ForeignKey('out_wmq.id', ondelete='CASCADE'), nullable=False, primary_key=False)
+    target = relationship(OutgoingWMQ, backref=backref('delivery_def_list', order_by=target_id, cascade='all, delete, delete-orphan'))
+
+    def __init__(self, id=None, target_id=None):
+        self.id = id
+        self.target_id = target_id
+    
+class Delivery(Base):
+    """ A guaranteed delivery.
+    """
+    __tablename__ = 'delivery'
+    
+    id = Column(Integer, Sequence('deliv_seq'), primary_key=True)
+    task_id = Column(String(64), unique=True, nullable=False, index=True)
+
+    name = Column(String(200), nullable=False)    
+    creation_time = Column(DateTime(), nullable=False)
+    
+    args = Column(LargeBinary(1000000), nullable=True)
+    kwargs = Column(LargeBinary(1000000), nullable=True)
+    
+    last_used = Column(DateTime(), nullable=True)
+    resubmit_count = Column(Integer, nullable=False, default=0)
+    
+    state = Column(String(200), nullable=False, index=True)
+    
+    source_count = Column(Integer, nullable=False, default=1)
+    target_count = Column(Integer, nullable=False, default=0)
+    
+    definition_id = Column(Integer, ForeignKey('delivery_def_base.id', ondelete='CASCADE'), nullable=False, primary_key=False)
+    definition = relationship(DeliveryDefinitionBase, backref=backref('delivery_list', order_by=creation_time, cascade='all, delete, delete-orphan'))
+
+class DeliveryPayload(Base):
+    """ A guaranteed delivery's payload.
+    """
+    __tablename__ = 'delivery_payload'
+    
+    id = Column(Integer, Sequence('deliv_payl_seq'), primary_key=True)
+    task_id = Column(String(64), unique=True, nullable=False, index=True)
+    
+    creation_time = Column(DateTime(), nullable=False)
+    payload = Column(LargeBinary(5000000), nullable=False)
+    
+    delivery_id = Column(Integer, ForeignKey('delivery.id', ondelete='CASCADE'), nullable=False, primary_key=False)
+    delivery = relationship(Delivery, backref=backref('payload', uselist=False, cascade='all, delete, delete-orphan', single_parent=True))
+    
+class DeliveryHistory(Base):
+    """ A guaranteed delivery's history.
+    """
+    __tablename__ = 'delivery_history'
+    
+    id = Column(Integer, Sequence('deliv_payl_seq'), primary_key=True)
+    task_id = Column(String(64), nullable=False, index=True)
+    
+    entry_type = Column(String(64), nullable=False)
+    entry_time = Column(DateTime(), nullable=False, index=True)
+    entry_ctx = Column(LargeBinary(6000000), nullable=False)
+    resubmit_count = Column(Integer, nullable=False, default=0) # Copy of delivery.resubmit_count so it's known for each history entry
+    
+    delivery_id = Column(Integer, ForeignKey('delivery.id', ondelete='CASCADE'), nullable=False, primary_key=False)
+    delivery = relationship(Delivery, backref=backref('history_list', order_by=entry_time, cascade='all, delete, delete-orphan'))

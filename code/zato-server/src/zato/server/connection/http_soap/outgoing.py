@@ -18,7 +18,7 @@ from datetime import datetime
 import requests
 
 # Zato
-from zato.common import Inactive
+from zato.common import Inactive, URL_TYPE
 from zato.common.util import get_component_name, security_def_type
 
 logger = logging.getLogger(__name__)
@@ -26,12 +26,12 @@ logger = logging.getLogger(__name__)
 class HTTPSOAPWrapper(object):
     """ A thin wrapper around the API exposed by the 'requests' package.
     """
-    def __init__(self, config):
+    def __init__(self, config, requests_module=None):
         self.config = config
         self.config_no_sensitive = deepcopy(self.config)
         self.config_no_sensitive['password'] = '***'
-        self.requests_module = requests
-        self.session = self.requests_module.session()
+        self.requests_module = requests_module or requests
+        self.session = self.requests_module.session(pool_maxsize=self.config['pool_size'])
         
         self._component_name = get_component_name()
         
@@ -39,7 +39,7 @@ class HTTPSOAPWrapper(object):
         self.soap['1.1'] = {}
         self.soap['1.1']['content_type'] = 'text/xml; charset=utf-8'
         self.soap['1.1']['message'] = """<?xml version="1.0" encoding="utf-8"?>
-<s11:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<s11:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:s11="http://schemas.xmlsoap.org/soap/envelope/">
   {header}
   <s11:Body>{data}</s11:Body>
 </s11:Envelope>"""
@@ -56,7 +56,7 @@ class HTTPSOAPWrapper(object):
         self.soap['1.2'] = {}
         self.soap['1.2']['content_type'] = 'application/soap+xml; charset=utf-8'
         self.soap['1.2']['message'] = """<?xml version="1.0" encoding="utf-8"?>
-<s12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<s12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:s12="http://www.w3.org/2003/05/soap-envelope/">
   {header}
   <s12:Body></s12:Body>
 </s12:Envelope>"""
@@ -112,6 +112,10 @@ class HTTPSOAPWrapper(object):
             'X-Zato-Component':self._component_name,
             'X-Zato-Msg-TS':datetime.utcnow().isoformat(),
             }
+
+        if self.config.get('transport') == URL_TYPE.SOAP:
+            headers['SOAPAction'] = self.config.get('soap_action')
+
         headers.update(user_headers)
         
         return headers
@@ -132,12 +136,18 @@ class HTTPSOAPWrapper(object):
         
         start = datetime.utcnow()
         
+        def zato_pre_request_hook(hook_data, *args, **kwargs):
+            entry = '{} (UTC) {} {}\n'.format(datetime.utcnow().isoformat(), 
+                hook_data['request'].method, hook_data['request'].url)
+            verbose.write(entry)
+        
         # .. invoke the other end ..
-        r = self.session.head(self.config['address'], auth=self.requests_auth, prefetch=True,
-                config={'verbose':verbose}, headers=self._create_headers(cid, {}))
+        response = self.session.request(self.config['ping_method'], self.config['address'], 
+                auth=self.requests_auth, headers=self._create_headers(cid, {}),
+                hooks={'zato_pre_request':zato_pre_request_hook})
         
         # .. store additional info, get and close the stream.
-        verbose.write('Code: {}'.format(r.status_code))
+        verbose.write('Code: {}'.format(response.status_code))
         verbose.write('\nResponse time: {}'.format(datetime.utcnow() - start))
         value = verbose.getvalue()
         verbose.close()
@@ -151,7 +161,7 @@ class HTTPSOAPWrapper(object):
         
         headers = self._create_headers(cid, kwargs.pop('headers', {}))
         return self.session.get(self.config['address'], params=params or {}, 
-            prefetch=prefetch, auth=self.requests_auth, headers=headers, *args, **kwargs)
+            auth=self.requests_auth, headers=headers, *args, **kwargs)
     
     def _soap_data(self, data, headers):
         """ Wraps the data in a SOAP-specific messages and adds the headers required.
@@ -181,6 +191,6 @@ class HTTPSOAPWrapper(object):
             data, headers = self._soap_data(data, headers)
 
         return self.session.post(self.config['address'], data=data, 
-            prefetch=prefetch, auth=self.requests_auth, headers=headers, *args, **kwargs)
+            auth=self.requests_auth, headers=headers, *args, **kwargs)
     
     send = post

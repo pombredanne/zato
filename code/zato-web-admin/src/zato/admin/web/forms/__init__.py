@@ -14,7 +14,8 @@ from django import forms
 # Zato
 from zato.common import SIMPLE_IO
 
-INITIAL_CHOICES = ('', '----------')
+INITIAL_CHOICES_DICT = {'': '----------'}
+INITIAL_CHOICES = INITIAL_CHOICES_DICT.items()[0]
 
 class ChooseClusterForm(forms.Form):
 
@@ -35,6 +36,7 @@ class ChangePasswordForm(forms.Form):
 
 class DataFormatForm(forms.Form):
     data_format = forms.ChoiceField(widget=forms.Select())
+    
     def __init__(self, *args, **kwargs):
         super(DataFormatForm, self).__init__(*args, **kwargs)
         self.fields['data_format'].choices = []
@@ -44,4 +46,4 @@ class DataFormatForm(forms.Form):
                 self.fields['data_format'].choices.append([name.lower(), name])
                 
 class UploadForm(forms.Form):
-    file  = forms.FileField(widget=forms.FileInput(attrs={'size':'70'}))
+    file = forms.FileField(widget=forms.FileInput(attrs={'size':'70'}))

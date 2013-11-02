@@ -24,9 +24,9 @@ WMQ_DEFAULT_PRIORITY = 5
 # ODB version
 VERSION = 1
 
-SUPPORTED_DB_TYPES = (b'oracle', b'postgresql')
+SUPPORTED_DB_TYPES = (b'oracle', b'postgresql', b'mysql')
 
-engine_def = '{engine}://{username}:{password}@{host}/{db_name}'
+engine_def = '{engine}://{username}:{password}@{host}:{port}/{db_name}'
 
 # Queries to use in pinging the databases.
 ping_queries = {
@@ -36,6 +36,7 @@ ping_queries = {
     'informix': 'SELECT 1 FROM systables WHERE tabid=1',
     'mssql': 'SELECT 1',
     'mysql': 'SELECT 1+1',
+    'mysql+pymysql': 'SELECT 1+1',
     'oracle': 'SELECT 1 FROM dual',
     'postgresql': 'SELECT 1',
 }
@@ -71,11 +72,11 @@ def drop_all(engine):
     for table in [name for (name,) in engine.execute(text(table_sql))]:
         try:
             engine.execute(text('DROP TABLE %s CASCADE' % table))
-        except SQLError, e:
+        except Exception, e:
             print(e)
 
     for seq in [name for (name,) in engine.execute(text(sequence_sql))]:
         try:
             engine.execute(text('DROP SEQUENCE %s CASCADE' % seq))
-        except SQLError, e:
+        except Exception, e:
             print(e)
